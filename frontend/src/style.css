@@ -214,6 +214,10 @@ textarea:focus {
   align-self: flex-start;
 }
 
+.secondary-button.compact {
+  min-height: 36px;
+}
+
 .icon-button {
   flex: 0 0 auto;
   width: 36px;
@@ -378,6 +382,108 @@ textarea:focus {
 .editor-toolbar {
   margin-top: 20px;
   padding: 0 2px 10px;
+}
+
+.chapter-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-bottom: 16px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.chapter-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 0;
+  margin: 0;
+  list-style: none;
+}
+
+.chapter-item {
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.chapter-header {
+  display: grid;
+  width: 100%;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 11px 12px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+}
+
+.chapter-header:hover {
+  background: var(--surface-soft);
+}
+
+.chapter-header svg {
+  transition: transform 0.16s ease;
+}
+
+.chapter-header svg.collapsed {
+  transform: rotate(-90deg);
+}
+
+.chapter-header strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chapter-header span {
+  color: var(--muted);
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.chunk-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 0 12px 12px 44px;
+}
+
+.chunk-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 10px;
+  border-radius: 7px;
+  background: #f8fafc;
+}
+
+.chunk-item div {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.chunk-item strong {
+  font-size: 14px;
+}
+
+.chunk-item span,
+.chunk-item small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.chunk-item small {
+  flex: 0 0 auto;
 }
 
 .editor-grid {

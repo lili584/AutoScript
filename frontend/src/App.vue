@@ -2,13 +2,16 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import {
   BookOpen,
+  ChevronDown,
   ClipboardPlus,
   FileText,
   FileUp,
+  Layers,
   ListTree,
   Plus,
   RefreshCw,
   Save,
+  Scissors,
   Trash2,
   Upload,
 } from 'lucide-vue-next'
@@ -23,6 +26,9 @@ const createFileInput = ref(null)
 const contentFileInput = ref(null)
 const contentEditor = ref(null)
 const pendingFileMode = ref('append')
+const chapters = ref([])
+const expandedChapterIds = ref(new Set())
+const parseSummary = ref(null)
 
 const form = reactive({
   title: '',
@@ -36,6 +42,7 @@ const appendDraft = ref('')
 const selectedId = computed(() => selectedNovel.value?.id)
 const hasNovels = computed(() => novels.value.length > 0)
 const outlineItems = computed(() => parseMarkdownOutline(contentDraft.value))
+const chunkCount = computed(() => chapters.value.reduce((total, chapter) => total + chapter.chunkCount, 0))
 
 onMounted(() => {
   loadNovels()
@@ -164,10 +171,57 @@ async function selectNovel(id) {
   try {
     selectedNovel.value = await request(`/api/novels/${id}`)
     contentDraft.value = selectedNovel.value.content || ''
+    await loadChapters(id)
   } catch (error) {
     errorMessage.value = error.message
   } finally {
     loading.value = false
+  }
+}
+
+async function loadChapters(id = selectedId.value) {
+  if (!id) {
+    chapters.value = []
+    parseSummary.value = null
+    return
+  }
+
+  try {
+    chapters.value = await request(`/api/novels/${id}/chapters`)
+    parseSummary.value = chapters.value.length
+      ? {
+        chapterCount: chapters.value.length,
+        chunkCount: chunkCount.value,
+      }
+      : null
+  } catch (error) {
+    chapters.value = []
+    parseSummary.value = null
+  }
+}
+
+async function parseChapters() {
+  if (!selectedId.value) {
+    return
+  }
+
+  clearMessage()
+  saving.value = true
+  try {
+    const result = await request(`/api/novels/${selectedId.value}/chapters/parse`, {
+      method: 'POST',
+    })
+    chapters.value = result.chapters || []
+    parseSummary.value = {
+      chapterCount: result.chapterCount,
+      chunkCount: result.chunkCount,
+    }
+    expandedChapterIds.value = new Set(chapters.value.slice(0, 1).map((chapter) => chapter.id))
+    successMessage.value = `解析完成：${result.chapterCount} 章，${result.chunkCount} 个分块`
+  } catch (error) {
+    errorMessage.value = error.message
+  } finally {
+    saving.value = false
   }
 }
 
@@ -184,6 +238,8 @@ async function saveContent() {
       body: JSON.stringify({ content: contentDraft.value }),
     })
     contentDraft.value = selectedNovel.value.content || ''
+    chapters.value = []
+    parseSummary.value = null
     successMessage.value = '原始文本已保存'
     await loadNovels()
   } catch (error) {
@@ -212,6 +268,8 @@ async function appendText() {
     })
     contentDraft.value = selectedNovel.value.content || ''
     appendDraft.value = ''
+    chapters.value = []
+    parseSummary.value = null
     successMessage.value = '文本已追加'
     await loadNovels()
   } catch (error) {
@@ -241,6 +299,8 @@ async function saveContentFromFile(event) {
       body: buildMarkdownFormData(file, { mode: pendingFileMode.value }),
     })
     contentDraft.value = selectedNovel.value.content || ''
+    chapters.value = []
+    parseSummary.value = null
     successMessage.value = pendingFileMode.value === 'overwrite' ? 'Markdown 文件已覆盖原始文本' : 'Markdown 文件已追加'
     await loadNovels()
   } catch (error) {
@@ -264,6 +324,8 @@ async function deleteNovel(id) {
     if (selectedId.value === id) {
       selectedNovel.value = null
       contentDraft.value = ''
+      chapters.value = []
+      parseSummary.value = null
     }
     await loadNovels()
     successMessage.value = '小说已删除'
@@ -278,6 +340,16 @@ function resetForm() {
   form.title = ''
   form.description = ''
   form.content = ''
+}
+
+function toggleChapter(id) {
+  const next = new Set(expandedChapterIds.value)
+  if (next.has(id)) {
+    next.delete(id)
+  } else {
+    next.add(id)
+  }
+  expandedChapterIds.value = next
 }
 
 function clearMessage() {
@@ -464,11 +536,44 @@ function jumpToOutline(item) {
 
         <div class="editor-toolbar">
           <h3>原始文本</h3>
-          <button class="primary-button compact" type="button" :disabled="saving" @click="saveContent">
-            <Save :size="17" />
-            保存
-          </button>
+          <div class="button-row">
+            <button class="secondary-button compact" type="button" :disabled="saving" @click="parseChapters">
+              <Scissors :size="17" />
+              解析章节
+            </button>
+            <button class="primary-button compact" type="button" :disabled="saving" @click="saveContent">
+              <Save :size="17" />
+              保存
+            </button>
+          </div>
         </div>
+
+        <section class="chapter-panel">
+          <div class="section-title">
+            <h2><Layers :size="18" /> 章节分块</h2>
+            <span>{{ parseSummary ? `${parseSummary.chapterCount}/${parseSummary.chunkCount}` : '0/0' }}</span>
+          </div>
+          <div v-if="chapters.length === 0" class="outline-empty">点击解析章节生成分块</div>
+          <ul v-else class="chapter-list">
+            <li v-for="chapter in chapters" :key="chapter.id" class="chapter-item">
+              <button class="chapter-header" type="button" @click="toggleChapter(chapter.id)">
+                <ChevronDown :class="{ collapsed: !expandedChapterIds.has(chapter.id) }" :size="18" />
+                <strong>{{ chapter.orderIndex }}. {{ chapter.title }}</strong>
+                <span>{{ chapter.chunkCount }} 个分块</span>
+              </button>
+              <div v-if="expandedChapterIds.has(chapter.id)" class="chunk-list">
+                <div v-for="chunk in chapter.chunks" :key="chunk.id" class="chunk-item">
+                  <div>
+                    <strong>Chunk {{ chunk.chunkIndex }}</strong>
+                    <span>{{ chunk.charCount }} 字 · 段落 {{ chunk.paragraphStart }}-{{ chunk.paragraphEnd }}</span>
+                  </div>
+                  <small>{{ chunk.hasContext ? '含上下文' : '无上下文' }}</small>
+                </div>
+              </div>
+            </li>
+          </ul>
+        </section>
+
         <div class="editor-grid">
           <textarea
             ref="contentEditor"

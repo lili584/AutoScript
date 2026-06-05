@@ -6,6 +6,7 @@ import com.duck.bankend.model.dto.NovelCreateRequest;
 import com.duck.bankend.model.dto.NovelUpdateContentRequest;
 import com.duck.bankend.model.entity.Novel;
 import com.duck.bankend.service.NovelService;
+import com.duck.bankend.service.NovelStructureService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -27,6 +28,7 @@ import java.io.IOException;
 public class NovelController {
 
     private final NovelService novelService;
+    private final NovelStructureService novelStructureService;
 
     @PostMapping
     public Result createNovel(@RequestBody NovelCreateRequest request) {
@@ -65,6 +67,35 @@ public class NovelController {
             return Result.notFound("小说不存在或已删除");
         }
         return Result.searchSuccess(novel);
+    }
+
+    @PostMapping("/{id}/chapters/parse")
+    public Result parseChapters(@PathVariable Long id) {
+        try {
+            Object result = novelStructureService.parseNovel(id);
+            if (result == null) {
+                return Result.notFound("小说不存在或已删除");
+            }
+            return Result.success("解析章节成功", result);
+        } catch (IllegalArgumentException exception) {
+            return Result.badRequest(exception.getMessage());
+        }
+    }
+
+    @GetMapping("/{id}/chapters")
+    public Result listChapters(@PathVariable Long id) {
+        if (novelService.getActiveNovel(id) == null) {
+            return Result.notFound("小说不存在或已删除");
+        }
+        return Result.searchSuccess(novelStructureService.listChapters(id));
+    }
+
+    @GetMapping("/{id}/chunks")
+    public Result listChunks(@PathVariable Long id) {
+        if (novelService.getActiveNovel(id) == null) {
+            return Result.notFound("小说不存在或已删除");
+        }
+        return Result.searchSuccess(novelStructureService.listChunks(id));
     }
 
     @PutMapping("/{id}/content")
