@@ -5,6 +5,7 @@ import {
   ClipboardPlus,
   FileText,
   FileUp,
+  ListTree,
   Plus,
   RefreshCw,
   Save,
@@ -20,6 +21,7 @@ const errorMessage = ref('')
 const successMessage = ref('')
 const createFileInput = ref(null)
 const contentFileInput = ref(null)
+const contentEditor = ref(null)
 const pendingFileMode = ref('append')
 
 const form = reactive({
@@ -33,6 +35,7 @@ const appendDraft = ref('')
 
 const selectedId = computed(() => selectedNovel.value?.id)
 const hasNovels = computed(() => novels.value.length > 0)
+const outlineItems = computed(() => parseMarkdownOutline(contentDraft.value))
 
 onMounted(() => {
   loadNovels()
@@ -293,6 +296,43 @@ function formatDate(value) {
     minute: '2-digit',
   }).format(new Date(value))
 }
+
+function parseMarkdownOutline(content) {
+  if (!content) {
+    return []
+  }
+
+  const lines = content.split(/\r?\n/)
+  let offset = 0
+  const items = []
+  lines.forEach((line, index) => {
+    const match = /^(#{1,2})\s+(.+)$/.exec(line)
+    if (match) {
+      items.push({
+        id: `${index}-${offset}`,
+        level: match[1].length,
+        title: match[2].trim(),
+        line: index + 1,
+        start: offset,
+        end: offset + line.length,
+      })
+    }
+    offset += line.length + 1
+  })
+  return items
+}
+
+function jumpToOutline(item) {
+  const editor = contentEditor.value
+  if (!editor) {
+    return
+  }
+  editor.focus()
+  editor.setSelectionRange(item.start, item.end)
+
+  const lineHeight = Number.parseFloat(window.getComputedStyle(editor).lineHeight) || 22
+  editor.scrollTop = Math.max(0, (item.line - 3) * lineHeight)
+}
 </script>
 
 <template>
@@ -429,12 +469,36 @@ function formatDate(value) {
             保存
           </button>
         </div>
-        <textarea
-          v-model="contentDraft"
-          class="content-editor"
-          spellcheck="false"
-          placeholder="# 小说标题&#10;&#10;## 第一章&#10;&#10;输入或粘贴小说正文"
-        />
+        <div class="editor-grid">
+          <textarea
+            ref="contentEditor"
+            v-model="contentDraft"
+            class="content-editor"
+            spellcheck="false"
+            placeholder="# 小说标题&#10;&#10;## 第一章&#10;&#10;输入或粘贴小说正文"
+          />
+
+          <aside class="outline-panel">
+            <div class="section-title">
+              <h2><ListTree :size="18" /> 文档大纲</h2>
+              <span>{{ outlineItems.length }}</span>
+            </div>
+            <div v-if="outlineItems.length === 0" class="outline-empty">暂无一级或二级标题</div>
+            <ul v-else class="outline-list">
+              <li v-for="item in outlineItems" :key="item.id">
+                <button
+                  class="outline-item"
+                  :class="{ child: item.level === 2 }"
+                  type="button"
+                  @click="jumpToOutline(item)"
+                >
+                  <span>{{ item.title }}</span>
+                  <small>第 {{ item.line }} 行</small>
+                </button>
+              </li>
+            </ul>
+          </aside>
+        </div>
       </template>
     </section>
   </main>
