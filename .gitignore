@@ -1,0 +1,19 @@
+### IntelliJ IDEA ###
+.idea/
+*.iml
+*.iws
+*.ipr
+
+### Maven ###
+target/
+!.mvn/wrapper/maven-wrapper.jar
+
+### Node ###
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+### Logs ###
+logs/
+*.log
