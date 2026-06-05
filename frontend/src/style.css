@@ -168,14 +168,15 @@ textarea:focus {
 }
 
 .primary-button,
+.secondary-button,
 .icon-button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border: 0;
 }
 
 .primary-button {
+  border: 0;
   gap: 8px;
   min-height: 40px;
   padding: 0 15px;
@@ -191,6 +192,26 @@ textarea:focus {
 
 .primary-button.compact {
   min-height: 36px;
+}
+
+.secondary-button {
+  gap: 8px;
+  min-height: 40px;
+  padding: 0 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  font-weight: 700;
+}
+
+.secondary-button:hover {
+  border-color: var(--primary);
+  color: var(--primary);
+}
+
+.secondary-button.align-start {
+  align-self: flex-start;
 }
 
 .icon-button {
@@ -331,6 +352,27 @@ textarea:focus {
   gap: 6px;
   font-size: 13px;
   white-space: nowrap;
+}
+
+.import-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 18px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.button-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.file-input {
+  display: none;
 }
 
 .editor-toolbar {

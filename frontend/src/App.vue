@@ -1,6 +1,16 @@
 <script setup>
 import { computed, onMounted, reactive, ref } from 'vue'
-import { BookOpen, FileText, Plus, RefreshCw, Save, Trash2 } from 'lucide-vue-next'
+import {
+  BookOpen,
+  ClipboardPlus,
+  FileText,
+  FileUp,
+  Plus,
+  RefreshCw,
+  Save,
+  Trash2,
+  Upload,
+} from 'lucide-vue-next'
 
 const novels = ref([])
 const selectedNovel = ref(null)
@@ -8,6 +18,9 @@ const loading = ref(false)
 const saving = ref(false)
 const errorMessage = ref('')
 const successMessage = ref('')
+const createFileInput = ref(null)
+const contentFileInput = ref(null)
+const pendingFileMode = ref('append')
 
 const form = reactive({
   title: '',
@@ -16,6 +29,7 @@ const form = reactive({
 })
 
 const contentDraft = ref('')
+const appendDraft = ref('')
 
 const selectedId = computed(() => selectedNovel.value?.id)
 const hasNovels = computed(() => novels.value.length > 0)
@@ -25,18 +39,45 @@ onMounted(() => {
 })
 
 async function request(path, options = {}) {
-  const response = await fetch(path, {
-    headers: {
+  const isFormData = options.body instanceof FormData
+  const headers = isFormData
+    ? options.headers || {}
+    : {
       'Content-Type': 'application/json',
       ...options.headers,
-    },
+    }
+
+  const response = await fetch(path, {
     ...options,
+    headers,
   })
   const result = await response.json()
   if (result.code >= 400) {
     throw new Error(result.msg || '请求失败')
   }
   return result.data
+}
+
+function validateMarkdownFile(file) {
+  if (!file) {
+    return false
+  }
+  if (!file.name.toLowerCase().endsWith('.md')) {
+    errorMessage.value = '只支持上传 .md 文件'
+    return false
+  }
+  return true
+}
+
+function buildMarkdownFormData(file, extra = {}) {
+  const data = new FormData()
+  data.append('file', file)
+  Object.entries(extra).forEach(([key, value]) => {
+    if (value) {
+      data.append(key, value)
+    }
+  })
+  return data
 }
 
 async function loadNovels() {
@@ -86,6 +127,34 @@ async function createNovel() {
   }
 }
 
+async function createNovelFromFile(event) {
+  clearMessage()
+  const file = event.target.files?.[0]
+  event.target.value = ''
+  if (!validateMarkdownFile(file)) {
+    return
+  }
+
+  saving.value = true
+  try {
+    const novel = await request('/api/novels/import/file', {
+      method: 'POST',
+      body: buildMarkdownFormData(file, {
+        title: form.title.trim(),
+        description: form.description.trim(),
+      }),
+    })
+    resetForm()
+    await loadNovels()
+    await selectNovel(novel.id)
+    successMessage.value = 'Markdown 文件已导入为新小说'
+  } catch (error) {
+    errorMessage.value = error.message
+  } finally {
+    saving.value = false
+  }
+}
+
 async function selectNovel(id) {
   clearMessage()
   loading.value = true
@@ -113,6 +182,63 @@ async function saveContent() {
     })
     contentDraft.value = selectedNovel.value.content || ''
     successMessage.value = '原始文本已保存'
+    await loadNovels()
+  } catch (error) {
+    errorMessage.value = error.message
+  } finally {
+    saving.value = false
+  }
+}
+
+async function appendText() {
+  if (!selectedId.value) {
+    return
+  }
+
+  clearMessage()
+  if (!appendDraft.value.trim()) {
+    errorMessage.value = '请输入要追加的文本'
+    return
+  }
+
+  saving.value = true
+  try {
+    selectedNovel.value = await request(`/api/novels/${selectedId.value}/content/append`, {
+      method: 'POST',
+      body: JSON.stringify({ content: appendDraft.value }),
+    })
+    contentDraft.value = selectedNovel.value.content || ''
+    appendDraft.value = ''
+    successMessage.value = '文本已追加'
+    await loadNovels()
+  } catch (error) {
+    errorMessage.value = error.message
+  } finally {
+    saving.value = false
+  }
+}
+
+function triggerContentFileUpload(mode) {
+  pendingFileMode.value = mode
+  contentFileInput.value?.click()
+}
+
+async function saveContentFromFile(event) {
+  clearMessage()
+  const file = event.target.files?.[0]
+  event.target.value = ''
+  if (!selectedId.value || !validateMarkdownFile(file)) {
+    return
+  }
+
+  saving.value = true
+  try {
+    selectedNovel.value = await request(`/api/novels/${selectedId.value}/content/file`, {
+      method: 'POST',
+      body: buildMarkdownFormData(file, { mode: pendingFileMode.value }),
+    })
+    contentDraft.value = selectedNovel.value.content || ''
+    successMessage.value = pendingFileMode.value === 'overwrite' ? 'Markdown 文件已覆盖原始文本' : 'Markdown 文件已追加'
     await loadNovels()
   } catch (error) {
     errorMessage.value = error.message
@@ -201,6 +327,17 @@ function formatDate(value) {
             <Plus :size="18" />
             创建小说
           </button>
+          <input
+            ref="createFileInput"
+            class="file-input"
+            type="file"
+            accept=".md,text/markdown"
+            @change="createNovelFromFile"
+          />
+          <button class="secondary-button" type="button" :disabled="saving" @click="createFileInput?.click()">
+            <Upload :size="18" />
+            上传 md 创建
+          </button>
         </form>
       </section>
 
@@ -253,6 +390,37 @@ function formatDate(value) {
             <span>更新 {{ formatDate(selectedNovel.updatedAt) }}</span>
           </div>
         </header>
+
+        <section class="import-panel">
+          <div class="section-title">
+            <h2><FileUp :size="18" /> Markdown 导入</h2>
+          </div>
+          <input
+            ref="contentFileInput"
+            class="file-input"
+            type="file"
+            accept=".md,text/markdown"
+            @change="saveContentFromFile"
+          />
+          <div class="button-row">
+            <button class="secondary-button" type="button" :disabled="saving" @click="triggerContentFileUpload('overwrite')">
+              <Upload :size="17" />
+              上传覆盖
+            </button>
+            <button class="secondary-button" type="button" :disabled="saving" @click="triggerContentFileUpload('append')">
+              <ClipboardPlus :size="17" />
+              上传追加
+            </button>
+          </div>
+          <label>
+            <span>追加文本</span>
+            <textarea v-model="appendDraft" rows="4" placeholder="输入要追加到原始文本末尾的内容" />
+          </label>
+          <button class="secondary-button align-start" type="button" :disabled="saving" @click="appendText">
+            <ClipboardPlus :size="17" />
+            追加文本
+          </button>
+        </section>
 
         <div class="editor-toolbar">
           <h3>原始文本</h3>
