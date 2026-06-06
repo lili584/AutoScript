@@ -6,6 +6,12 @@ spring:
     username: ${DB_USERNAME:agent}
     password: ${DB_PASSWORD:agent123}
     driver-class-name: org.postgresql.Driver
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      username: ${REDIS_USERNAME:autoscript}
+      password: ${REDIS_PASSWORD:autoscriptRedis123!}
   sql:
     init:
       mode: always
@@ -21,3 +27,9 @@ deepseek:
     key: ${DEEPSEEK_API_KEY:}
     model: ${DEEPSEEK_MODEL:deepseek-v4-flash}
     max-tokens: ${DEEPSEEK_MAX_TOKENS:8000}
+
+script:
+  generation:
+    max-running-tasks: ${SCRIPT_GENERATION_MAX_RUNNING_TASKS:1}
+    max-deepseek-requests: ${SCRIPT_GENERATION_MAX_DEEPSEEK_REQUESTS:1}
+    runtime-ttl-minutes: ${SCRIPT_GENERATION_RUNTIME_TTL_MINUTES:30}

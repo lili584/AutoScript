@@ -2,9 +2,10 @@
 
 ## 技术栈
 
-- Spring Boot 4.0.6，Java 17。
+- Spring Boot 4.0.6，Java 21。
 - MyBatis Plus 3.5.16。
 - PostgreSQL，建表脚本维护在 `src/main/resources/db/schema.sql`。
+- Redis 保存 AI 任务运行态、进度和运行锁；持久结果仍写 PostgreSQL。
 - DeepSeek 使用 OpenAI 兼容 HTTP 接口，不把 API Key 写入配置文件默认值。
 
 ## 目录约定
@@ -28,8 +29,10 @@
 ## 本地配置
 
 - 数据库连接默认读取 `DB_URL`、`DB_USERNAME`、`DB_PASSWORD`，可使用 `application.yaml` 的默认本地值。
+- Redis 本地开发可用 `docker compose -f ..\docker-compose.redis.yml up -d` 启动，默认读取 `REDIS_HOST`、`REDIS_PORT`、`REDIS_USERNAME`、`REDIS_PASSWORD`。
 - DeepSeek API Key 使用环境变量：`DEEPSEEK_API_KEY`。
 - DeepSeek 模型可通过 `DEEPSEEK_MODEL` 覆盖。
+- AI 任务并发可通过 `SCRIPT_GENERATION_MAX_RUNNING_TASKS`、`SCRIPT_GENERATION_MAX_DEEPSEEK_REQUESTS`、`SCRIPT_GENERATION_RUNTIME_TTL_MINUTES` 覆盖。
 
 ## 验证
 
