@@ -400,6 +400,7 @@ async function startAiAnalysis() {
     startPolling()
   } catch (error) {
     errorMessage.value = error.message
+    window.alert(error.message)
   } finally {
     saving.value = false
   }
