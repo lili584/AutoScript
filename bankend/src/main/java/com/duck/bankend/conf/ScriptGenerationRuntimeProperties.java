@@ -15,12 +15,12 @@ public class ScriptGenerationRuntimeProperties {
     /**
      * 同一 JVM 内最多同时运行的 AI 分析任务数量。
      */
-    private int maxRunningTasks = 1;
+    private int maxRunningTasks = 2;
 
     /**
      * 同一 JVM 内最多同时发出的 DeepSeek 请求数量。
      */
-    private int maxDeepseekRequests = 1;
+    private int maxDeepseekRequests = 3;
 
     /**
      * Redis 中任务运行态和运行锁的 TTL，单位分钟。

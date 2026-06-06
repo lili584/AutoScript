@@ -5,6 +5,9 @@ import com.duck.bankend.model.dto.ScriptGenerationTaskView;
 import com.duck.bankend.model.entity.ScriptGenerationTask;
 import com.duck.bankend.service.ScriptGenerationRuntimeService;
 import lombok.RequiredArgsConstructor;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
+import org.redisson.client.RedisException;
 import org.springframework.data.redis.RedisConnectionFailureException;
 import org.springframework.data.redis.RedisSystemException;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -23,14 +26,15 @@ public class RedisScriptGenerationRuntimeServiceImpl implements ScriptGeneration
     private static final String KEY_PREFIX = "autoscript:script-task:";
 
     private final StringRedisTemplate redisTemplate;
+    private final RedissonClient redissonClient;
     private final ScriptGenerationRuntimeProperties properties;
 
     @Override
     public boolean acquireNovelLock(Long novelId) {
         try {
-            Boolean acquired = redisTemplate.opsForValue().setIfAbsent(lockKey(novelId), "starting", ttl());
-            return Boolean.TRUE.equals(acquired);
-        } catch (RedisConnectionFailureException | RedisSystemException exception) {
+            RLock lock = redissonClient.getLock(lockKey(novelId));
+            return lock.tryLock();
+        } catch (RedisConnectionFailureException | RedisSystemException | RedisException exception) {
             throw new IllegalArgumentException("Redis 不可用，无法启动 AI 分析任务，请先启动 Redis");
         }
     }
@@ -38,7 +42,6 @@ public class RedisScriptGenerationRuntimeServiceImpl implements ScriptGeneration
     @Override
     public void bindTask(Long novelId, Long taskId) {
         try {
-            redisTemplate.opsForValue().set(lockKey(novelId), String.valueOf(taskId), ttl());
             redisTemplate.opsForValue().set(latestKey(novelId), String.valueOf(taskId), ttl());
         } catch (RedisConnectionFailureException | RedisSystemException exception) {
             throw new IllegalArgumentException("Redis 不可用，无法写入 AI 任务运行态");
@@ -48,8 +51,8 @@ public class RedisScriptGenerationRuntimeServiceImpl implements ScriptGeneration
     @Override
     public void releaseNovelLock(Long novelId) {
         try {
-            redisTemplate.delete(lockKey(novelId));
-        } catch (RedisConnectionFailureException | RedisSystemException ignored) {
+            redissonClient.getLock(lockKey(novelId)).forceUnlock();
+        } catch (RedisConnectionFailureException | RedisSystemException | RedisException ignored) {
             // 释放锁失败不影响 PG 中的最终任务状态。
         }
     }
@@ -78,7 +81,6 @@ public class RedisScriptGenerationRuntimeServiceImpl implements ScriptGeneration
             redisTemplate.opsForHash().putAll(runtimeKey, values);
             redisTemplate.expire(runtimeKey, ttl());
             redisTemplate.opsForValue().set(latestKey(task.getNovelId()), String.valueOf(task.getId()), ttl());
-            redisTemplate.opsForValue().set(lockKey(task.getNovelId()), String.valueOf(task.getId()), ttl());
         } catch (RedisConnectionFailureException | RedisSystemException ignored) {
             // 运行态缓存失败时继续执行任务，最终状态仍会写入 PG。
         }
@@ -109,7 +111,7 @@ public class RedisScriptGenerationRuntimeServiceImpl implements ScriptGeneration
                 redisTemplate.delete(runtimeKey(Long.valueOf(taskId)));
             }
             redisTemplate.delete(latestKey(novelId));
-            redisTemplate.delete(lockKey(novelId));
+            releaseNovelLock(novelId);
         } catch (RedisConnectionFailureException | RedisSystemException | NumberFormatException ignored) {
             // 清理运行态失败不影响数据库清理。
         }

@@ -30,6 +30,6 @@ deepseek:
 
 script:
   generation:
-    max-running-tasks: ${SCRIPT_GENERATION_MAX_RUNNING_TASKS:1}
-    max-deepseek-requests: ${SCRIPT_GENERATION_MAX_DEEPSEEK_REQUESTS:1}
+    max-running-tasks: ${SCRIPT_GENERATION_MAX_RUNNING_TASKS:2}
+    max-deepseek-requests: ${SCRIPT_GENERATION_MAX_DEEPSEEK_REQUESTS:3}
     runtime-ttl-minutes: ${SCRIPT_GENERATION_RUNTIME_TTL_MINUTES:30}
