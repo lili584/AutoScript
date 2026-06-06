@@ -7,6 +7,7 @@ import com.duck.bankend.model.dto.NovelUpdateContentRequest;
 import com.duck.bankend.model.entity.Novel;
 import com.duck.bankend.service.NovelService;
 import com.duck.bankend.service.NovelStructureService;
+import com.duck.bankend.service.ScriptGenerationService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -29,6 +30,7 @@ public class NovelController {
 
     private final NovelService novelService;
     private final NovelStructureService novelStructureService;
+    private final ScriptGenerationService scriptGenerationService;
 
     @PostMapping
     public Result createNovel(@RequestBody NovelCreateRequest request) {
@@ -96,6 +98,44 @@ public class NovelController {
             return Result.notFound("小说不存在或已删除");
         }
         return Result.searchSuccess(novelStructureService.listChunks(id));
+    }
+
+    @PostMapping("/{id}/scripts/generate")
+    public Result generateScriptScenes(@PathVariable Long id) {
+        try {
+            Object task = scriptGenerationService.startGeneration(id);
+            if (task == null) {
+                return Result.notFound("小说不存在或已删除");
+            }
+            return Result.success("AI 分析任务已创建", task);
+        } catch (IllegalArgumentException exception) {
+            return Result.badRequest(exception.getMessage());
+        }
+    }
+
+    @GetMapping("/{id}/scripts/tasks/latest")
+    public Result getLatestScriptTask(@PathVariable Long id) {
+        if (novelService.getActiveNovel(id) == null) {
+            return Result.notFound("小说不存在或已删除");
+        }
+        return Result.searchSuccess(scriptGenerationService.getLatestTask(id));
+    }
+
+    @GetMapping("/{id}/scripts/scenes")
+    public Result listScriptScenes(@PathVariable Long id) {
+        if (novelService.getActiveNovel(id) == null) {
+            return Result.notFound("小说不存在或已删除");
+        }
+        return Result.searchSuccess(scriptGenerationService.listScenes(id));
+    }
+
+    @DeleteMapping("/{id}/scripts/scenes")
+    public Result clearScriptScenes(@PathVariable Long id) {
+        if (novelService.getActiveNovel(id) == null) {
+            return Result.notFound("小说不存在或已删除");
+        }
+        scriptGenerationService.clearScenes(id);
+        return Result.deleteSuccess();
     }
 
     @PutMapping("/{id}/content")

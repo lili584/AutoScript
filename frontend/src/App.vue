@@ -1,6 +1,7 @@
 <script setup>
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import {
+  Bot,
   BookOpen,
   ChevronDown,
   ClipboardPlus,
@@ -12,6 +13,7 @@ import {
   RefreshCw,
   Save,
   Scissors,
+  Sparkles,
   Trash2,
   Upload,
 } from 'lucide-vue-next'
@@ -29,6 +31,9 @@ const pendingFileMode = ref('append')
 const chapters = ref([])
 const expandedChapterIds = ref(new Set())
 const parseSummary = ref(null)
+const scriptTask = ref(null)
+const scriptScenes = ref([])
+const pollingTimer = ref(null)
 
 const form = reactive({
   title: '',
@@ -46,6 +51,10 @@ const chunkCount = computed(() => chapters.value.reduce((total, chapter) => tota
 
 onMounted(() => {
   loadNovels()
+})
+
+onUnmounted(() => {
+  stopPolling()
 })
 
 async function request(path, options = {}) {
@@ -172,10 +181,29 @@ async function selectNovel(id) {
     selectedNovel.value = await request(`/api/novels/${id}`)
     contentDraft.value = selectedNovel.value.content || ''
     await loadChapters(id)
+    await loadScriptState(id)
   } catch (error) {
     errorMessage.value = error.message
   } finally {
     loading.value = false
+  }
+}
+
+async function loadScriptState(id = selectedId.value) {
+  if (!id) {
+    resetScriptState()
+    return
+  }
+
+  try {
+    scriptTask.value = await request(`/api/novels/${id}/scripts/tasks/latest`)
+    scriptScenes.value = await request(`/api/novels/${id}/scripts/scenes`)
+    if (scriptTask.value && ['pending', 'running'].includes(scriptTask.value.status)) {
+      startPolling()
+    }
+  } catch (error) {
+    scriptTask.value = null
+    scriptScenes.value = []
   }
 }
 
@@ -240,6 +268,7 @@ async function saveContent() {
     contentDraft.value = selectedNovel.value.content || ''
     chapters.value = []
     parseSummary.value = null
+    resetScriptState()
     successMessage.value = '原始文本已保存'
     await loadNovels()
   } catch (error) {
@@ -270,6 +299,7 @@ async function appendText() {
     appendDraft.value = ''
     chapters.value = []
     parseSummary.value = null
+    resetScriptState()
     successMessage.value = '文本已追加'
     await loadNovels()
   } catch (error) {
@@ -301,6 +331,7 @@ async function saveContentFromFile(event) {
     contentDraft.value = selectedNovel.value.content || ''
     chapters.value = []
     parseSummary.value = null
+    resetScriptState()
     successMessage.value = pendingFileMode.value === 'overwrite' ? 'Markdown 文件已覆盖原始文本' : 'Markdown 文件已追加'
     await loadNovels()
   } catch (error) {
@@ -326,6 +357,7 @@ async function deleteNovel(id) {
       contentDraft.value = ''
       chapters.value = []
       parseSummary.value = null
+      resetScriptState()
     }
     await loadNovels()
     successMessage.value = '小说已删除'
@@ -350,6 +382,89 @@ function toggleChapter(id) {
     next.add(id)
   }
   expandedChapterIds.value = next
+}
+
+async function startAiAnalysis() {
+  if (!selectedId.value) {
+    return
+  }
+
+  clearMessage()
+  saving.value = true
+  try {
+    scriptScenes.value = []
+    scriptTask.value = await request(`/api/novels/${selectedId.value}/scripts/generate`, {
+      method: 'POST',
+    })
+    successMessage.value = 'AI 分析任务已创建'
+    startPolling()
+  } catch (error) {
+    errorMessage.value = error.message
+    window.alert(error.message)
+  } finally {
+    saving.value = false
+  }
+}
+
+async function clearScriptScenes() {
+  if (!selectedId.value) {
+    return
+  }
+
+  clearMessage()
+  saving.value = true
+  try {
+    await request(`/api/novels/${selectedId.value}/scripts/scenes`, { method: 'DELETE' })
+    scriptScenes.value = []
+    successMessage.value = 'AI 场景草稿已清空'
+  } catch (error) {
+    errorMessage.value = error.message
+  } finally {
+    saving.value = false
+  }
+}
+
+function startPolling() {
+  stopPolling()
+  pollingTimer.value = window.setInterval(async () => {
+    if (!selectedId.value) {
+      stopPolling()
+      return
+    }
+    try {
+      scriptTask.value = await request(`/api/novels/${selectedId.value}/scripts/tasks/latest`)
+      if (!scriptTask.value || !['pending', 'running'].includes(scriptTask.value.status)) {
+        stopPolling()
+        scriptScenes.value = await request(`/api/novels/${selectedId.value}/scripts/scenes`)
+      }
+    } catch (error) {
+      stopPolling()
+      errorMessage.value = error.message
+    }
+  }, 2000)
+}
+
+function stopPolling() {
+  if (pollingTimer.value) {
+    window.clearInterval(pollingTimer.value)
+    pollingTimer.value = null
+  }
+}
+
+function resetScriptState() {
+  stopPolling()
+  scriptTask.value = null
+  scriptScenes.value = []
+}
+
+function taskStatusText(status) {
+  const statusMap = {
+    pending: '等待中',
+    running: '分析中',
+    succeeded: '已完成',
+    failed: '失败',
+  }
+  return statusMap[status] || '未开始'
 }
 
 function clearMessage() {
@@ -569,6 +684,50 @@ function jumpToOutline(item) {
                   </div>
                   <small>{{ chunk.hasContext ? '含上下文' : '无上下文' }}</small>
                 </div>
+              </div>
+            </li>
+          </ul>
+        </section>
+
+        <section class="ai-panel">
+          <div class="section-title">
+            <h2><Bot :size="18" /> AI 分析</h2>
+            <span>{{ scriptScenes.length }}</span>
+          </div>
+
+          <div class="ai-actions">
+            <button class="primary-button compact" type="button" :disabled="saving" @click="startAiAnalysis">
+              <Sparkles :size="17" />
+              开始 AI 分析
+            </button>
+            <button class="secondary-button compact" type="button" :disabled="saving || scriptScenes.length === 0" @click="clearScriptScenes">
+              <Trash2 :size="17" />
+              清空草稿
+            </button>
+          </div>
+
+          <div v-if="scriptTask" class="task-card">
+            <div>
+              <strong>{{ taskStatusText(scriptTask.status) }}</strong>
+              <span>{{ scriptTask.processedChunks }} / {{ scriptTask.totalChunks }} chunks</span>
+            </div>
+            <div class="progress">
+              <i :style="{ width: `${scriptTask.progressPercent || 0}%` }" />
+            </div>
+            <p v-if="scriptTask.errorMessage">{{ scriptTask.errorMessage }}</p>
+          </div>
+          <div v-else class="outline-empty">解析章节后可开始 AI 场景抽取</div>
+
+          <ul v-if="scriptScenes.length > 0" class="scene-list">
+            <li v-for="scene in scriptScenes" :key="scene.id" class="scene-item">
+              <div class="scene-main">
+                <strong>{{ scene.title }}</strong>
+                <span>{{ scene.location || '未知地点' }} · {{ scene.timeOfDay || '未知时间' }}</span>
+                <p>{{ scene.summary || '暂无概要' }}</p>
+              </div>
+              <div class="scene-meta">
+                <span>{{ scene.characters?.join('、') || '未识别人物' }}</span>
+                <small>{{ scene.beatsCount }} beats</small>
               </div>
             </li>
           </ul>
