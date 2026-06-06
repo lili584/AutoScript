@@ -88,3 +88,18 @@ create table if not exists script_dialogues (
 
 create index if not exists idx_script_dialogues_scene
     on script_dialogues (scene_db_id);
+
+create table if not exists script_chapter_states (
+    id bigserial primary key,
+    novel_id bigint not null,
+    chapter_id bigint not null,
+    chunk_id bigint not null,
+    chapter_index integer not null,
+    chunk_index integer not null,
+    state_json text not null,
+    created_at timestamp not null default current_timestamp,
+    updated_at timestamp not null default current_timestamp
+);
+
+create index if not exists idx_script_chapter_states_novel_order
+    on script_chapter_states (novel_id, chapter_index, chunk_index);

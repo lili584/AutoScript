@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.duck.bankend.mapper.NovelChapterMapper;
 import com.duck.bankend.mapper.NovelChunkMapper;
+import com.duck.bankend.mapper.ScriptChapterStateMapper;
 import com.duck.bankend.mapper.ScriptDialogueMapper;
 import com.duck.bankend.mapper.ScriptGenerationTaskMapper;
 import com.duck.bankend.mapper.ScriptSceneMapper;
@@ -16,10 +17,12 @@ import com.duck.bankend.model.dto.ScriptSceneView;
 import com.duck.bankend.model.entity.Novel;
 import com.duck.bankend.model.entity.NovelChapter;
 import com.duck.bankend.model.entity.NovelChunk;
+import com.duck.bankend.model.entity.ScriptChapterState;
 import com.duck.bankend.model.entity.ScriptDialogue;
 import com.duck.bankend.model.entity.ScriptGenerationTask;
 import com.duck.bankend.model.entity.ScriptScene;
 import com.duck.bankend.service.DeepSeekSceneClient;
+import com.duck.bankend.service.DeepSeekSceneClient.SceneExtractionResult;
 import com.duck.bankend.service.NovelService;
 import com.duck.bankend.service.ScriptGenerationService;
 import jakarta.annotation.PreDestroy;
@@ -55,6 +58,7 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
     private final DeepSeekSceneClient deepSeekSceneClient;
     private final NovelChapterMapper chapterMapper;
     private final NovelChunkMapper chunkMapper;
+    private final ScriptChapterStateMapper chapterStateMapper;
     private final ScriptGenerationTaskMapper taskMapper;
     private final ScriptSceneMapper sceneMapper;
     private final ScriptDialogueMapper dialogueMapper;
@@ -109,6 +113,7 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
             dialogueMapper.delete(new LambdaQueryWrapper<ScriptDialogue>().in(ScriptDialogue::getSceneDbId, sceneIds));
         }
         sceneMapper.delete(new LambdaQueryWrapper<ScriptScene>().eq(ScriptScene::getNovelId, novelId));
+        chapterStateMapper.delete(new LambdaQueryWrapper<ScriptChapterState>().eq(ScriptChapterState::getNovelId, novelId));
     }
 
     @Override
@@ -136,11 +141,35 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
             Map<Long, NovelChapter> chapters = loadChapters(task.getNovelId());
             List<NovelChunk> chunks = loadChunks(task.getNovelId());
             DedupState dedupState = new DedupState();
+            JsonNode previousChapterState = objectMapper.createObjectNode();
+            OpenSceneRef previousOpenScene = null;
+            Long currentChapterId = null;
 
             for (NovelChunk chunk : chunks) {
                 NovelChapter chapter = chapters.get(chunk.getChapterId());
-                JsonNode scenes = deepSeekSceneClient.extractScenes(novel, chapter, chunk);
-                saveScenes(novel, chapter, chunk, scenes, dedupState);
+                if (chapter == null) {
+                    throw new IllegalStateException("chunk 缺少对应章节，请重新解析章节后再分析");
+                }
+                if (!chapter.getId().equals(currentChapterId)) {
+                    previousChapterState = objectMapper.createObjectNode();
+                    previousOpenScene = null;
+                    currentChapterId = chapter.getId();
+                }
+
+                SceneExtractionResult extraction;
+                try {
+                    extraction = deepSeekSceneClient.extractScenes(novel, chapter, chunk, previousChapterState);
+                } catch (Exception exception) {
+                    throw new IllegalStateException("第 %d 章第 %d 个 chunk 分析失败: %s".formatted(
+                            chunk.getChapterIndex(),
+                            chunk.getChunkIndex(),
+                            exception.getMessage()
+                    ), exception);
+                }
+                SaveScenesResult saveResult = saveScenes(novel, chapter, chunk, extraction.scenes(), previousOpenScene, dedupState);
+                previousChapterState = normalizeChapterState(extraction.chapterState(), saveResult);
+                saveChapterState(novel, chapter, chunk, previousChapterState);
+                previousOpenScene = resolveOpenScene(previousChapterState, saveResult, chapter, chunk);
                 incrementProgress(task);
             }
             updateTaskStatus(task, STATUS_SUCCEEDED, null);
@@ -149,12 +178,21 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
         }
     }
 
-    private void saveScenes(Novel novel, NovelChapter chapter, NovelChunk chunk, JsonNode scenes, DedupState dedupState) {
+    private SaveScenesResult saveScenes(Novel novel, NovelChapter chapter, NovelChunk chunk, JsonNode scenes,
+                                        OpenSceneRef previousOpenScene, DedupState dedupState) {
+        SaveScenesResult result = new SaveScenesResult();
         int sceneNumber = 1;
         for (JsonNode sceneNode : scenes) {
-            String sceneId = textOrDefault(sceneNode, "scene_id",
-                    "chapter-%d-chunk-%d-scene-%d".formatted(chunk.getChapterIndex(), chunk.getChunkIndex(), sceneNumber));
+            String rawSceneId = textOrDefault(sceneNode, "scene_id", "scene-%d".formatted(sceneNumber));
+            String sceneId = buildSceneId(sceneNode, chunk, sceneNumber);
             sceneNumber++;
+
+            if (sceneNumber == 2 && canMergeContinuation(sceneNode, chapter, chunk, previousOpenScene)) {
+                mergeScene(previousOpenScene.scene(), sceneNode, chapter, chunk, dedupState);
+                result.mapSceneId(rawSceneId, previousOpenScene.scene());
+                result.lastTouchedScene = previousOpenScene.scene();
+                continue;
+            }
 
             if (!dedupState.sceneIds.add(sceneId)) {
                 continue;
@@ -163,7 +201,9 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
             String summary = textOrDefault(sceneNode, "summary", "");
             ScriptScene similar = findSimilarScene(chapter.getId(), summary, dedupState);
             if (similar != null) {
-                mergeScene(similar, sceneNode, chapter.getId(), dedupState);
+                mergeScene(similar, sceneNode, chapter, chunk, dedupState);
+                result.mapSceneId(rawSceneId, similar);
+                result.lastTouchedScene = similar;
                 continue;
             }
 
@@ -186,7 +226,10 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
             sceneMapper.insert(scene);
             saveDialogues(scene.getId(), beats);
             dedupState.scenesByChapter.computeIfAbsent(chapter.getId(), ignored -> new ArrayList<>()).add(scene);
+            result.mapSceneId(rawSceneId, scene);
+            result.lastTouchedScene = scene;
         }
+        return result;
     }
 
     private ScriptScene findSimilarScene(Long chapterId, String summary, DedupState dedupState) {
@@ -201,19 +244,218 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
         return null;
     }
 
-    private void mergeScene(ScriptScene target, JsonNode sceneNode, Long chapterId, DedupState dedupState) {
+    private String buildSceneId(JsonNode sceneNode, NovelChunk chunk, int sceneNumber) {
+        String rawSceneId = textOrDefault(sceneNode, "scene_id", "scene-%d".formatted(sceneNumber));
+        String normalized = normalizeSceneId(rawSceneId);
+        if (normalized.matches("chapter-\\d+-chunk-\\d+-.+")) {
+            return normalized;
+        }
+        return "chapter-%d-chunk-%d-%s".formatted(chunk.getChapterIndex(), chunk.getChunkIndex(), normalized);
+    }
+
+    private String normalizeSceneId(String sceneId) {
+        String normalized = sceneId == null ? "" : sceneId.trim().toLowerCase();
+        normalized = normalized.replaceAll("[^a-z0-9\\u4e00-\\u9fa5_-]+", "-");
+        normalized = normalized.replaceAll("-+", "-").replaceAll("^-|-$", "");
+        return StringUtils.hasText(normalized) ? normalized : "scene";
+    }
+
+    private boolean canMergeContinuation(JsonNode sceneNode, NovelChapter chapter, NovelChunk chunk, OpenSceneRef previousOpenScene) {
+        if (previousOpenScene == null || !sceneNode.path("is_continuation").asBoolean(false)) {
+            return false;
+        }
+        if (!chapter.getId().equals(previousOpenScene.chapterId())) {
+            return false;
+        }
+        if (chunk.getChapterIndex() != previousOpenScene.chapterIndex() || chunk.getChunkIndex() != previousOpenScene.chunkIndex() + 1) {
+            return false;
+        }
+
+        String rawContinuationOf = textOrNull(sceneNode, "continuation_of");
+        String continuationOf = normalizeSceneId(rawContinuationOf);
+        String targetSceneId = normalizeSceneId(previousOpenScene.scene().getSceneId());
+        String stateSceneId = normalizeSceneId(previousOpenScene.stateSceneId());
+        if (StringUtils.hasText(rawContinuationOf)
+                && !continuationOf.equals(targetSceneId)
+                && !continuationOf.equals(stateSceneId)) {
+            return false;
+        }
+
+        if (hasConflict(previousOpenScene.scene().getLocation(), textOrNull(sceneNode, "location"))) {
+            return false;
+        }
+        if (hasConflict(previousOpenScene.scene().getTimeOfDay(), textOrNull(sceneNode, "time_of_day"))) {
+            return false;
+        }
+        return charactersCompatible(previousOpenScene.scene(), sceneNode);
+    }
+
+    private boolean hasConflict(String existing, String incoming) {
+        if (!StringUtils.hasText(existing) || !StringUtils.hasText(incoming)) {
+            return false;
+        }
+        return !normalize(existing).equals(normalize(incoming));
+    }
+
+    private boolean charactersCompatible(ScriptScene existing, JsonNode incomingScene) {
+        Set<String> existingCharacters = characterSet(asArray(readJson(existing.getCharactersJson())));
+        Set<String> incomingCharacters = characterSet(asArray(incomingScene.get("characters")));
+        if (existingCharacters.isEmpty() || incomingCharacters.isEmpty()) {
+            return true;
+        }
+        for (String character : incomingCharacters) {
+            if (existingCharacters.contains(character)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private Set<String> characterSet(ArrayNode characters) {
+        Set<String> names = new HashSet<>();
+        for (JsonNode character : characters) {
+            String name = character.isTextual() ? character.asText() : character.path("name").asText("");
+            if (StringUtils.hasText(name)) {
+                names.add(normalize(name));
+            }
+        }
+        return names;
+    }
+
+    private void mergeScene(ScriptScene target, JsonNode sceneNode, NovelChapter chapter, NovelChunk chunk, DedupState dedupState) {
         ArrayNode mergedBeats = asArray(readJson(target.getBeatsJson()));
-        ArrayNode newBeats = filterDialogueDuplicates(asArray(sceneNode.get("beats")), chapterId, dedupState);
+        ArrayNode newBeats = filterDialogueDuplicates(asArray(sceneNode.get("beats")), chapter.getId(), dedupState);
         newBeats.forEach(mergedBeats::add);
 
         ArrayNode mergedSources = asArray(readJson(target.getSourceRefsJson()));
-        asArray(sceneNode.get("source_refs")).forEach(mergedSources::add);
+        appendUniqueJson(mergedSources, resolveSourceRefs(sceneNode, chapter, chunk));
 
         target.setBeatsJson(writeJson(mergedBeats));
         target.setSourceRefsJson(writeJson(mergedSources));
+        String incomingSummary = textOrNull(sceneNode, "summary");
+        if (StringUtils.hasText(incomingSummary) && !normalize(incomingSummary).equals(normalize(target.getSummary()))) {
+            target.setSummary(mergeSummary(target.getSummary(), incomingSummary));
+        }
         target.setUpdatedAt(LocalDateTime.now());
         sceneMapper.updateById(target);
         saveDialogues(target.getId(), newBeats);
+    }
+
+    private String mergeSummary(String existing, String incoming) {
+        if (!StringUtils.hasText(existing)) {
+            return incoming;
+        }
+        if (!StringUtils.hasText(incoming)) {
+            return existing;
+        }
+        return existing + "\n" + incoming;
+    }
+
+    private void appendUniqueJson(ArrayNode target, ArrayNode additions) {
+        Set<String> existing = new HashSet<>();
+        target.forEach(item -> existing.add(item.toString()));
+        additions.forEach(item -> {
+            if (existing.add(item.toString())) {
+                target.add(item);
+            }
+        });
+    }
+
+    private JsonNode normalizeChapterState(JsonNode chapterState, SaveScenesResult saveResult) {
+        ObjectNode state = chapterState != null && chapterState.isObject()
+                ? (ObjectNode) chapterState.deepCopy()
+                : objectMapper.createObjectNode();
+        ensureTextField(state, "current_location");
+        ensureTextField(state, "current_conflict");
+        ensureArrayField(state, "active_characters");
+        ensureArrayField(state, "completed_events");
+        ensureArrayField(state, "unresolved_questions");
+
+        JsonNode openSceneNode = state.get("open_scene");
+        ObjectNode openScene = openSceneNode != null && openSceneNode.isObject()
+                ? (ObjectNode) openSceneNode.deepCopy()
+                : objectMapper.createObjectNode();
+        state.set("open_scene", openScene);
+
+        ScriptScene mappedScene = null;
+        String openSceneId = textOrNull(openScene, "scene_id");
+        if (StringUtils.hasText(openSceneId)) {
+            mappedScene = saveResult.findScene(openSceneId);
+        }
+        if (mappedScene == null && !openScene.path("is_resolved").asBoolean(false)) {
+            mappedScene = saveResult.lastTouchedScene;
+        }
+        if (mappedScene != null) {
+            openScene.put("scene_id", mappedScene.getSceneId());
+            String openSummary = textOrNull(openScene, "summary");
+            if (StringUtils.hasText(openSummary) && !normalize(openSummary).equals(normalize(mappedScene.getSummary()))) {
+                mappedScene.setSummary(openSummary);
+                mappedScene.setUpdatedAt(LocalDateTime.now());
+                sceneMapper.updateById(mappedScene);
+            }
+        }
+        ensureTextField(openScene, "scene_id");
+        ensureTextField(openScene, "title");
+        ensureTextField(openScene, "location");
+        ensureTextField(openScene, "time_of_day");
+        ensureArrayField(openScene, "characters");
+        ensureTextField(openScene, "summary");
+        if (!openScene.has("is_resolved") || !openScene.get("is_resolved").isBoolean()) {
+            openScene.put("is_resolved", true);
+        }
+        return state;
+    }
+
+    private void ensureTextField(ObjectNode node, String field) {
+        if (!node.has(field) || node.get(field).isNull()) {
+            node.put(field, "");
+        }
+    }
+
+    private void ensureArrayField(ObjectNode node, String field) {
+        if (!node.has(field) || !node.get(field).isArray()) {
+            node.set(field, objectMapper.createArrayNode());
+        }
+    }
+
+    private void saveChapterState(Novel novel, NovelChapter chapter, NovelChunk chunk, JsonNode chapterState) {
+        ScriptChapterState state = new ScriptChapterState();
+        LocalDateTime now = LocalDateTime.now();
+        state.setNovelId(novel.getId());
+        state.setChapterId(chapter.getId());
+        state.setChunkId(chunk.getId());
+        state.setChapterIndex(chunk.getChapterIndex());
+        state.setChunkIndex(chunk.getChunkIndex());
+        state.setStateJson(writeJson(chapterState));
+        state.setCreatedAt(now);
+        state.setUpdatedAt(now);
+        chapterStateMapper.insert(state);
+    }
+
+    private OpenSceneRef resolveOpenScene(JsonNode chapterState, SaveScenesResult saveResult, NovelChapter chapter, NovelChunk chunk) {
+        JsonNode openScene = chapterState == null ? null : chapterState.path("open_scene");
+        if (openScene == null || !openScene.isObject() || openScene.path("is_resolved").asBoolean(true)) {
+            return null;
+        }
+        String sceneId = textOrNull(openScene, "scene_id");
+        if (!StringUtils.hasText(sceneId)) {
+            return null;
+        }
+        ScriptScene scene = saveResult.findScene(sceneId);
+        if (scene == null) {
+            scene = loadSceneBySceneId(chapter.getId(), sceneId);
+        }
+        return scene == null ? null : new OpenSceneRef(scene, chapter.getId(), chunk.getChapterIndex(), chunk.getChunkIndex(), sceneId);
+    }
+
+    private ScriptScene loadSceneBySceneId(Long chapterId, String sceneId) {
+        return sceneMapper.selectList(new LambdaQueryWrapper<ScriptScene>()
+                        .eq(ScriptScene::getChapterId, chapterId)
+                        .eq(ScriptScene::getSceneId, sceneId)
+                        .last("limit 1"))
+                .stream()
+                .findFirst()
+                .orElse(null);
     }
 
     private ArrayNode filterDialogueDuplicates(ArrayNode beats, Long chapterId, DedupState dedupState) {
@@ -424,6 +666,29 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
             return "";
         }
         return value.replaceAll("[\\s\\p{Punct}，。！？、；：“”‘’（）《》【】]+", "").toLowerCase();
+    }
+
+    private class SaveScenesResult {
+        private final Map<String, ScriptScene> scenesBySceneId = new HashMap<>();
+        private ScriptScene lastTouchedScene;
+
+        private void mapSceneId(String rawSceneId, ScriptScene scene) {
+            if (scene == null) {
+                return;
+            }
+            scenesBySceneId.put(normalizeSceneId(rawSceneId), scene);
+            scenesBySceneId.put(normalizeSceneId(scene.getSceneId()), scene);
+        }
+
+        private ScriptScene findScene(String sceneId) {
+            if (!StringUtils.hasText(sceneId)) {
+                return null;
+            }
+            return scenesBySceneId.get(normalizeSceneId(sceneId));
+        }
+    }
+
+    private record OpenSceneRef(ScriptScene scene, Long chapterId, Integer chapterIndex, Integer chunkIndex, String stateSceneId) {
     }
 
     private static class DedupState {
