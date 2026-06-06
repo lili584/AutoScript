@@ -500,6 +500,23 @@ textarea:focus {
   text-align: right;
 }
 
+.yaml-export {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.yaml-preview {
+  width: 100%;
+  min-height: 280px;
+  max-height: 520px;
+  resize: vertical;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre;
+}
+
 .chapter-list {
   display: flex;
   flex-direction: column;
