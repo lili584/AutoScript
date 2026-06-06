@@ -1,0 +1,19 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: autoscript-redis
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --aclfile
+      - /usr/local/etc/redis/users.acl
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./docker/redis/users.acl:/usr/local/etc/redis/users.acl:ro
+      - autoscript-redis-data:/data
+    restart: unless-stopped
+
+volumes:
+  autoscript-redis-data:
