@@ -27,12 +27,15 @@ import com.duck.bankend.model.entity.ScriptDialogue;
 import com.duck.bankend.model.entity.ScriptGenerationTask;
 import com.duck.bankend.model.entity.ScriptScene;
 import com.duck.bankend.service.NovelService;
+import com.duck.bankend.service.ScriptGenerationConcurrencyLimiter;
+import com.duck.bankend.service.ScriptGenerationRuntimeService;
 import com.duck.bankend.service.ScriptGenerationService;
 import com.duck.bankend.util.ScriptCharacterNameNormalizer;
-import jakarta.annotation.PreDestroy;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.util.StringUtils;
 
 import java.time.LocalDateTime;
@@ -44,7 +47,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -54,9 +56,11 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
 
     private static final Pattern DIRECT_QUOTE_PATTERN = Pattern.compile("[“\"「『‘]([^”\"」』’]+)[”\"」』’]");
 
-    private final ExecutorService executorService = Executors.newSingleThreadExecutor();
     private final ObjectMapper objectMapper = new ObjectMapper();
 
+    private final ExecutorService scriptGenerationExecutorService;
+    private final ScriptGenerationConcurrencyLimiter concurrencyLimiter;
+    private final ScriptGenerationRuntimeService runtimeService;
     private final NovelService novelService;
     private final DeepSeekSceneClient deepSeekSceneClient;
     private final NovelChapterMapper chapterMapper;
@@ -82,24 +86,47 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
             throw new IllegalArgumentException("请先解析章节并生成分块");
         }
 
-        clearScenes(novelId);
-        LocalDateTime now = LocalDateTime.now();
-        ScriptGenerationTask task = new ScriptGenerationTask();
-        task.setNovelId(novelId);
-        task.setStatus(ScriptGenerationStatusConst.PENDING);
-        task.setTotalChunks(chunks.size());
-        task.setProcessedChunks(0);
-        task.setCreatedAt(now);
-        task.setUpdatedAt(now);
-        taskMapper.insert(task);
+        if (!runtimeService.acquireNovelLock(novelId)) {
+            throw new IllegalArgumentException("当前小说已有 AI 分析任务正在运行");
+        }
+        if (!concurrencyLimiter.tryAcquireTask()) {
+            runtimeService.releaseNovelLock(novelId);
+            throw new IllegalArgumentException("当前 AI 分析任务较多，请稍后重试");
+        }
 
-        executorService.submit(() -> runTask(task.getId()));
-        return ScriptGenerationTaskView.from(task);
+        boolean runtimeBound = false;
+        try {
+            clearScenes(novelId);
+            LocalDateTime now = LocalDateTime.now();
+            ScriptGenerationTask task = new ScriptGenerationTask();
+            task.setNovelId(novelId);
+            task.setStatus(ScriptGenerationStatusConst.PENDING);
+            task.setTotalChunks(chunks.size());
+            task.setProcessedChunks(0);
+            task.setCreatedAt(now);
+            task.setUpdatedAt(now);
+            taskMapper.insert(task);
+            runtimeService.bindTask(novelId, task.getId());
+            runtimeService.saveTaskState(task, null, null);
+            runtimeBound = true;
+
+            submitTaskAfterCommit(task.getId(), novelId);
+            return ScriptGenerationTaskView.from(task);
+        } catch (RuntimeException exception) {
+            concurrencyLimiter.releaseTask();
+            if (runtimeBound) {
+                runtimeService.deleteLatestTask(novelId);
+            } else {
+                runtimeService.releaseNovelLock(novelId);
+            }
+            throw exception;
+        }
     }
 
     @Override
     public ScriptGenerationTaskView getLatestTask(Long novelId) {
-        return ScriptGenerationTaskView.from(loadLatestTask(novelId));
+        ScriptGenerationTaskView runtimeTask = runtimeService.getLatestTask(novelId);
+        return runtimeTask == null ? ScriptGenerationTaskView.from(loadLatestTask(novelId)) : runtimeTask;
     }
 
     @Override
@@ -127,14 +154,44 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
         return overview;
     }
 
-    @PreDestroy
-    public void shutdown() {
-        executorService.shutdownNow();
+    private void submitTaskAfterCommit(Long taskId, Long novelId) {
+        Runnable submit = () -> {
+            try {
+                scriptGenerationExecutorService.submit(() -> runTask(taskId, novelId));
+            } catch (RuntimeException exception) {
+                concurrencyLimiter.releaseTask();
+                ScriptGenerationTask task = taskMapper.selectById(taskId);
+                if (task != null) {
+                    updateTaskStatus(task, ScriptGenerationStatusConst.FAILED, "提交 AI 分析任务失败: " + exception.getMessage());
+                }
+                runtimeService.releaseNovelLock(novelId);
+            }
+        };
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    submit.run();
+                }
+
+                @Override
+                public void afterCompletion(int status) {
+                    if (status != STATUS_COMMITTED) {
+                        concurrencyLimiter.releaseTask();
+                        runtimeService.deleteLatestTask(novelId);
+                    }
+                }
+            });
+        } else {
+            submit.run();
+        }
     }
 
-    private void runTask(Long taskId) {
+    private void runTask(Long taskId, Long novelId) {
         ScriptGenerationTask task = taskMapper.selectById(taskId);
         if (task == null) {
+            concurrencyLimiter.releaseTask();
+            runtimeService.releaseNovelLock(novelId);
             return;
         }
 
@@ -173,11 +230,14 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
                 previousChapterState = normalizeChapterState(extraction.chapterState(), saveResult);
                 saveChapterState(novel, chapter, chunk, previousChapterState);
                 previousOpenScene = resolveOpenScene(previousChapterState, saveResult, chapter, chunk);
-                incrementProgress(task);
+                incrementProgress(task, chunk);
             }
             updateTaskStatus(task, ScriptGenerationStatusConst.SUCCEEDED, null);
         } catch (Exception exception) {
             updateTaskStatus(task, ScriptGenerationStatusConst.FAILED, exception.getMessage());
+        } finally {
+            concurrencyLimiter.releaseTask();
+            runtimeService.releaseNovelLock(novelId);
         }
     }
 
@@ -188,7 +248,13 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
             String qualityInstruction = attempt == 0
                     ? DeepSeekPromptConst.DEFAULT_QUALITY_INSTRUCTION
                     : DeepSeekPromptConst.RETRY_QUALITY_INSTRUCTION_TEMPLATE.formatted(lastQualityCheck.message());
-            SceneExtractionResult extraction = deepSeekSceneClient.extractScenes(novel, chapter, chunk, previousChapterState, qualityInstruction);
+            SceneExtractionResult extraction;
+            concurrencyLimiter.acquireDeepSeekRequest();
+            try {
+                extraction = deepSeekSceneClient.extractScenes(novel, chapter, chunk, previousChapterState, qualityInstruction);
+            } finally {
+                concurrencyLimiter.releaseDeepSeekRequest();
+            }
             QualityCheck qualityCheck = sanitizeAndCheckScenes(extraction.scenes(), chunk);
             if (qualityCheck.accepted()) {
                 return new QualityCheckedExtraction(qualityCheck.scenes(), extraction.chapterState());
@@ -952,12 +1018,13 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
         }
         task.setUpdatedAt(now);
         taskMapper.updateById(task);
+        runtimeService.saveTaskState(task, null, null);
     }
 
-    private void incrementProgress(ScriptGenerationTask task) {
+    private void incrementProgress(ScriptGenerationTask task, NovelChunk chunk) {
         task.setProcessedChunks(task.getProcessedChunks() + 1);
         task.setUpdatedAt(LocalDateTime.now());
-        taskMapper.updateById(task);
+        runtimeService.saveTaskState(task, chunk.getChapterIndex(), chunk.getChunkIndex());
     }
 
     private ScriptGenerationTask loadLatestTask(Long novelId) {
