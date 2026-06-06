@@ -31,6 +31,9 @@ public class NovelStructureServiceImpl implements NovelStructureService {
 
     private static final int MIN_CHUNK_LENGTH = 1500;
     private static final int MAX_CHUNK_LENGTH = 2000;
+    private static final int MIN_CONTEXT_LENGTH = 300;
+    private static final int MAX_CONTEXT_LENGTH = 800;
+    private static final int MAX_CONTEXT_PARAGRAPHS = 6;
     private static final Pattern CHAPTER_HEADING_PATTERN = Pattern.compile("(?m)^##\\s+(.+)$");
 
     private final NovelService novelService;
@@ -192,11 +195,7 @@ public class NovelStructureServiceImpl implements NovelStructureService {
 
     private void addChunk(List<ChunkDraft> chunks, List<ParagraphRef> paragraphs) {
         List<ParagraphRef> previousParagraphs = chunks.isEmpty() ? List.of() : chunks.get(chunks.size() - 1).paragraphs();
-        String context = previousParagraphs.stream()
-                .skip(Math.max(0, previousParagraphs.size() - 2))
-                .map(ParagraphRef::text)
-                .reduce((left, right) -> left + "\n\n" + right)
-                .orElse(null);
+        String context = buildContext(previousParagraphs);
 
         String content = paragraphs.stream()
                 .map(ParagraphRef::text)
@@ -210,6 +209,29 @@ public class NovelStructureServiceImpl implements NovelStructureService {
                 paragraphs.get(0).index(),
                 paragraphs.get(paragraphs.size() - 1).index(),
                 List.copyOf(paragraphs)));
+    }
+
+    private String buildContext(List<ParagraphRef> previousParagraphs) {
+        if (previousParagraphs.isEmpty()) {
+            return null;
+        }
+
+        List<String> selected = new ArrayList<>();
+        int totalLength = 0;
+        for (int i = previousParagraphs.size() - 1; i >= 0 && selected.size() < MAX_CONTEXT_PARAGRAPHS; i--) {
+            String paragraph = previousParagraphs.get(i).text();
+            selected.add(0, paragraph);
+            totalLength += paragraph.length();
+            if (totalLength >= MIN_CONTEXT_LENGTH) {
+                break;
+            }
+        }
+
+        String context = String.join("\n\n", selected);
+        if (context.length() <= MAX_CONTEXT_LENGTH) {
+            return context;
+        }
+        return context.substring(context.length() - MAX_CONTEXT_LENGTH).trim();
     }
 
     private NovelParseResult buildParseResult(Long novelId) {
