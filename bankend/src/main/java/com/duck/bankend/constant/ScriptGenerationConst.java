@@ -31,9 +31,19 @@ public class ScriptGenerationConst {
     public static final double TEMPERATURE = 0.2;
 
     /**
-     * 单个 chunk 场景抽取最大输出 token 数。
+     * 单个 chunk 场景抽取默认最大输出 token 数。
      */
-    public static final int MAX_TOKENS = 4000;
+    public static final int DEFAULT_MAX_TOKENS = 8000;
+
+    /**
+     * AI 输出质量不合格时的最大重试次数。
+     */
+    public static final int MAX_QUALITY_RETRY = 1;
+
+    /**
+     * action/transition beat 空文本比例超过该阈值时，判定该 chunk 输出质量不合格。
+     */
+    public static final double MAX_EMPTY_ACTION_RATIO = 0.5;
 
     /**
      * HTTP 错误响应在任务错误信息中的最大展示长度。

@@ -32,11 +32,19 @@ public class DeepSeekSceneClient {
     @Value("${deepseek.api.model}")
     private String model;
 
+    @Value("${deepseek.api.max-tokens:8000}")
+    private int maxTokens;
+
     public boolean isConfigured() {
         return StringUtils.hasText(apiKey);
     }
 
     public SceneExtractionResult extractScenes(Novel novel, NovelChapter chapter, NovelChunk chunk, JsonNode previousChapterState) {
+        return extractScenes(novel, chapter, chunk, previousChapterState, DeepSeekPromptConst.DEFAULT_QUALITY_INSTRUCTION);
+    }
+
+    public SceneExtractionResult extractScenes(Novel novel, NovelChapter chapter, NovelChunk chunk, JsonNode previousChapterState,
+                                               String qualityInstruction) {
         if (!isConfigured()) {
             throw new IllegalStateException("未配置 DEEPSEEK_API_KEY");
         }
@@ -50,12 +58,12 @@ public class DeepSeekSceneClient {
                 "model", model,
                 "messages", List.of(
                         Map.of("role", "system", "content", DeepSeekPromptConst.SYSTEM_PROMPT),
-                        Map.of("role", "user", "content", buildUserPrompt(novel, chapter, chunk, previousChapterState))
+                        Map.of("role", "user", "content", buildUserPrompt(novel, chapter, chunk, previousChapterState, qualityInstruction))
                 ),
                 "response_format", Map.of("type", ScriptGenerationConst.RESPONSE_FORMAT_JSON_OBJECT),
                 "thinking", Map.of("type", ScriptGenerationConst.THINKING_DISABLED),
                 "temperature", ScriptGenerationConst.TEMPERATURE,
-                "max_tokens", ScriptGenerationConst.MAX_TOKENS
+                "max_tokens", maxTokens > 0 ? maxTokens : ScriptGenerationConst.DEFAULT_MAX_TOKENS
         );
 
         String responseBody;
@@ -144,7 +152,8 @@ public class DeepSeekSceneClient {
                 : value.substring(0, ScriptGenerationConst.RESPONSE_ABBREVIATE_LENGTH) + "...";
     }
 
-    private String buildUserPrompt(Novel novel, NovelChapter chapter, NovelChunk chunk, JsonNode previousChapterState) {
+    private String buildUserPrompt(Novel novel, NovelChapter chapter, NovelChunk chunk, JsonNode previousChapterState,
+                                   String qualityInstruction) {
         return DeepSeekPromptConst.USER_PROMPT_TEMPLATE.formatted(
                 novel.getTitle(),
                 chunk.getChapterIndex(),
@@ -154,8 +163,29 @@ public class DeepSeekSceneClient {
                 chunk.getParagraphEnd(),
                 hasChapterState(previousChapterState) ? previousChapterState.toPrettyString() : DeepSeekPromptConst.NONE,
                 StringUtils.hasText(chunk.getContext()) ? chunk.getContext() : DeepSeekPromptConst.NONE,
-                chunk.getContent()
+                StringUtils.hasText(qualityInstruction) ? qualityInstruction : DeepSeekPromptConst.DEFAULT_QUALITY_INSTRUCTION,
+                numberedChunkContent(chunk)
         );
+    }
+
+    private String numberedChunkContent(NovelChunk chunk) {
+        if (!StringUtils.hasText(chunk.getContent())) {
+            return "";
+        }
+        String[] paragraphs = chunk.getContent().trim().split("\\n\\s*\\n+");
+        StringBuilder builder = new StringBuilder();
+        int paragraphNumber = chunk.getParagraphStart() == null ? 1 : chunk.getParagraphStart();
+        for (String paragraph : paragraphs) {
+            if (!StringUtils.hasText(paragraph)) {
+                continue;
+            }
+            builder.append("[P")
+                    .append(paragraphNumber++)
+                    .append("] ")
+                    .append(paragraph.trim())
+                    .append("\n\n");
+        }
+        return builder.toString().trim();
     }
 
     private boolean hasChapterState(JsonNode previousChapterState) {
