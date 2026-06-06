@@ -4,11 +4,16 @@ import com.duck.bankend.model.bean.Result;
 import com.duck.bankend.model.dto.NovelAppendContentRequest;
 import com.duck.bankend.model.dto.NovelCreateRequest;
 import com.duck.bankend.model.dto.NovelUpdateContentRequest;
+import com.duck.bankend.model.dto.ScriptYamlPreview;
 import com.duck.bankend.model.entity.Novel;
 import com.duck.bankend.service.NovelService;
 import com.duck.bankend.service.NovelStructureService;
 import com.duck.bankend.service.ScriptGenerationService;
+import com.duck.bankend.service.ScriptYamlExportService;
 import lombok.RequiredArgsConstructor;
+import org.springframework.http.ContentDisposition;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.ResponseEntity;
 import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -31,6 +36,7 @@ public class NovelController {
     private final NovelService novelService;
     private final NovelStructureService novelStructureService;
     private final ScriptGenerationService scriptGenerationService;
+    private final ScriptYamlExportService scriptYamlExportService;
 
     @PostMapping
     public Result createNovel(@RequestBody NovelCreateRequest request) {
@@ -136,6 +142,33 @@ public class NovelController {
         }
         scriptGenerationService.clearScenes(id);
         return Result.deleteSuccess();
+    }
+
+    @GetMapping("/{id}/scripts/yaml/preview")
+    public Result previewScriptYaml(@PathVariable Long id) {
+        try {
+            return Result.searchSuccess(scriptYamlExportService.previewYaml(id));
+        } catch (IllegalArgumentException exception) {
+            return Result.badRequest(exception.getMessage());
+        }
+    }
+
+    @GetMapping(value = "/{id}/scripts/yaml/download", produces = "text/yaml;charset=UTF-8")
+    public ResponseEntity<String> downloadScriptYaml(@PathVariable Long id) {
+        try {
+            ScriptYamlPreview preview = scriptYamlExportService.downloadYaml(id);
+            ContentDisposition disposition = ContentDisposition.attachment()
+                    .filename(preview.getFileName(), java.nio.charset.StandardCharsets.UTF_8)
+                    .build();
+            return ResponseEntity.ok()
+                    .header(HttpHeaders.CONTENT_DISPOSITION, disposition.toString())
+                    .contentType(MediaType.parseMediaType("text/yaml;charset=UTF-8"))
+                    .body(preview.getContent());
+        } catch (IllegalArgumentException exception) {
+            return ResponseEntity.badRequest()
+                    .contentType(MediaType.TEXT_PLAIN)
+                    .body(exception.getMessage());
+        }
     }
 
     @PutMapping("/{id}/content")

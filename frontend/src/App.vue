@@ -5,6 +5,8 @@ import {
   BookOpen,
   ChevronDown,
   ClipboardPlus,
+  Download,
+  Eye,
   FileText,
   FileUp,
   Layers,
@@ -33,6 +35,8 @@ const expandedChapterIds = ref(new Set())
 const parseSummary = ref(null)
 const scriptTask = ref(null)
 const scriptScenes = ref([])
+const yamlPreview = ref('')
+const yamlFileName = ref('')
 const pollingTimer = ref(null)
 
 const form = reactive({
@@ -180,6 +184,7 @@ async function selectNovel(id) {
   try {
     selectedNovel.value = await request(`/api/novels/${id}`)
     contentDraft.value = selectedNovel.value.content || ''
+    resetYamlState()
     await loadChapters(id)
     await loadScriptState(id)
   } catch (error) {
@@ -393,6 +398,7 @@ async function startAiAnalysis() {
   saving.value = true
   try {
     scriptScenes.value = []
+    resetYamlState()
     scriptTask.value = await request(`/api/novels/${selectedId.value}/scripts/generate`, {
       method: 'POST',
     })
@@ -416,6 +422,7 @@ async function clearScriptScenes() {
   try {
     await request(`/api/novels/${selectedId.value}/scripts/scenes`, { method: 'DELETE' })
     scriptScenes.value = []
+    resetYamlState()
     successMessage.value = 'AI 场景草稿已清空'
   } catch (error) {
     errorMessage.value = error.message
@@ -436,6 +443,7 @@ function startPolling() {
       if (!scriptTask.value || !['pending', 'running'].includes(scriptTask.value.status)) {
         stopPolling()
         scriptScenes.value = await request(`/api/novels/${selectedId.value}/scripts/scenes`)
+        resetYamlState()
       }
     } catch (error) {
       stopPolling()
@@ -455,6 +463,84 @@ function resetScriptState() {
   stopPolling()
   scriptTask.value = null
   scriptScenes.value = []
+  resetYamlState()
+}
+
+function resetYamlState() {
+  yamlPreview.value = ''
+  yamlFileName.value = ''
+}
+
+async function previewYaml() {
+  if (!selectedId.value) {
+    return
+  }
+
+  clearMessage()
+  saving.value = true
+  try {
+    const preview = await request(`/api/novels/${selectedId.value}/scripts/yaml/preview`)
+    yamlPreview.value = preview.content || ''
+    yamlFileName.value = preview.fileName || ''
+    successMessage.value = 'YAML 已生成预览'
+  } catch (error) {
+    errorMessage.value = error.message
+  } finally {
+    saving.value = false
+  }
+}
+
+async function downloadYaml() {
+  if (!selectedId.value) {
+    return
+  }
+
+  clearMessage()
+  saving.value = true
+  try {
+    const response = await fetch(`/api/novels/${selectedId.value}/scripts/yaml/download`)
+    if (!response.ok) {
+      throw new Error(await response.text() || '下载 YAML 失败')
+    }
+    const blob = await response.blob()
+    const url = window.URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = extractDownloadFileName(response) || yamlFileName.value || `${selectedNovel.value?.title || '剧本'}-剧本.yaml`
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    window.URL.revokeObjectURL(url)
+    successMessage.value = 'YAML 已开始下载'
+  } catch (error) {
+    errorMessage.value = error.message
+  } finally {
+    saving.value = false
+  }
+}
+
+function extractDownloadFileName(response) {
+  const disposition = response.headers.get('Content-Disposition') || response.headers.get('content-disposition')
+  if (!disposition) {
+    return ''
+  }
+
+  const encodedMatch = disposition.match(/filename\*=UTF-8''([^;]+)/i)
+  if (encodedMatch?.[1]) {
+    try {
+      return decodeURIComponent(encodedMatch[1])
+    } catch {
+      return encodedMatch[1]
+    }
+  }
+
+  const quotedMatch = disposition.match(/filename="([^"]+)"/i)
+  if (quotedMatch?.[1]) {
+    return quotedMatch[1]
+  }
+
+  const plainMatch = disposition.match(/filename=([^;]+)/i)
+  return plainMatch?.[1]?.trim() || ''
 }
 
 function taskStatusText(status) {
@@ -731,6 +817,26 @@ function jumpToOutline(item) {
               </div>
             </li>
           </ul>
+
+          <div v-if="scriptScenes.length > 0" class="yaml-export">
+            <div class="ai-actions">
+              <button class="secondary-button compact" type="button" :disabled="saving" @click="previewYaml">
+                <Eye :size="17" />
+                预览 YAML
+              </button>
+              <button class="primary-button compact" type="button" :disabled="saving" @click="downloadYaml">
+                <Download :size="17" />
+                下载 YAML
+              </button>
+            </div>
+            <textarea
+              v-if="yamlPreview"
+              v-model="yamlPreview"
+              class="yaml-preview"
+              spellcheck="false"
+              readonly
+            />
+          </div>
         </section>
 
         <div class="editor-grid">
