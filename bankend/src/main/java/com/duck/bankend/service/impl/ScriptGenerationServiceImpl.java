@@ -45,10 +45,14 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 @Service
 @RequiredArgsConstructor
 public class ScriptGenerationServiceImpl implements ScriptGenerationService {
+
+    private static final Pattern DIRECT_QUOTE_PATTERN = Pattern.compile("[“\"「『‘]([^”\"」』’]+)[”\"」』’]");
 
     private final ExecutorService executorService = Executors.newSingleThreadExecutor();
     private final ObjectMapper objectMapper = new ObjectMapper();
@@ -185,7 +189,7 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
                     ? DeepSeekPromptConst.DEFAULT_QUALITY_INSTRUCTION
                     : DeepSeekPromptConst.RETRY_QUALITY_INSTRUCTION_TEMPLATE.formatted(lastQualityCheck.message());
             SceneExtractionResult extraction = deepSeekSceneClient.extractScenes(novel, chapter, chunk, previousChapterState, qualityInstruction);
-            QualityCheck qualityCheck = sanitizeAndCheckScenes(extraction.scenes());
+            QualityCheck qualityCheck = sanitizeAndCheckScenes(extraction.scenes(), chunk);
             if (qualityCheck.accepted()) {
                 return new QualityCheckedExtraction(qualityCheck.scenes(), extraction.chapterState());
             }
@@ -194,7 +198,7 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
         throw new IllegalStateException("AI 输出质量不合格: " + (lastQualityCheck == null ? "未知错误" : lastQualityCheck.message()));
     }
 
-    private QualityCheck sanitizeAndCheckScenes(JsonNode rawScenes) {
+    private QualityCheck sanitizeAndCheckScenes(JsonNode rawScenes, NovelChunk chunk) {
         ArrayNode sanitizedScenes = objectMapper.createArrayNode();
         int rawSceneCount = 0;
         int rawActionCount = 0;
@@ -204,7 +208,7 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
 
         for (JsonNode sceneNode : asArray(rawScenes)) {
             rawSceneCount++;
-            SanitizedScene sanitizedScene = sanitizeScene(sceneNode);
+            SanitizedScene sanitizedScene = sanitizeScene(sceneNode, chunk);
             rawActionCount += sanitizedScene.rawActionCount();
             emptyActionCount += sanitizedScene.emptyActionCount();
             validActionCount += sanitizedScene.validActionCount();
@@ -230,7 +234,7 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
         return new QualityCheck(reasons.isEmpty(), sanitizedScenes, String.join("；", reasons));
     }
 
-    private SanitizedScene sanitizeScene(JsonNode sceneNode) {
+    private SanitizedScene sanitizeScene(JsonNode sceneNode, NovelChunk chunk) {
         if (sceneNode == null || !sceneNode.isObject()) {
             return new SanitizedScene(null, 0, 0, 0, 0);
         }
@@ -279,9 +283,15 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
                 }
                 characterNames.add(characterName);
                 ObjectNode sanitizedBeat = objectMapper.createObjectNode();
-                sanitizedBeat.put("type", "dialogue");
-                sanitizedBeat.put("character_name", characterName);
-                sanitizedBeat.put("text", text.trim());
+                if (isDirectQuotedDialogue(text, chunk)) {
+                    sanitizedBeat.put("type", "dialogue");
+                    sanitizedBeat.put("character_name", characterName);
+                    sanitizedBeat.put("text", text.trim());
+                } else {
+                    sanitizedBeat.put("type", "action");
+                    sanitizedBeat.put("text", indirectDialogueActionText(characterName, text));
+                    validActionCount++;
+                }
                 beats.add(sanitizedBeat);
                 continue;
             }
@@ -318,16 +328,19 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
     private SaveScenesResult saveScenes(Novel novel, NovelChapter chapter, NovelChunk chunk, JsonNode scenes,
                                         OpenSceneRef previousOpenScene, DedupState dedupState) {
         SaveScenesResult result = new SaveScenesResult();
-        int totalScenes = Math.max(1, asArray(scenes).size());
+        ArrayNode sceneArray = asArray(scenes);
+        int totalScenes = Math.max(1, sceneArray.size());
+        List<SourceRange> sourceRanges = resolveChunkSceneRanges(sceneArray, chunk);
         int sceneNumber = 1;
-        for (JsonNode sceneNode : scenes) {
+        for (JsonNode sceneNode : sceneArray) {
             int currentSceneNumber = sceneNumber;
+            SourceRange sourceRange = sourceRanges.get(currentSceneNumber - 1);
             String rawSceneId = textOrDefault(sceneNode, "scene_id", "scene-%d".formatted(sceneNumber));
             String sceneId = buildSceneId(sceneNode, chunk, sceneNumber);
             sceneNumber++;
 
             if (sceneNumber == 2 && canMergeContinuation(sceneNode, chapter, chunk, previousOpenScene)) {
-                mergeScene(previousOpenScene.scene(), sceneNode, chapter, chunk, currentSceneNumber, totalScenes, dedupState);
+                mergeScene(previousOpenScene.scene(), sceneNode, chapter, chunk, sourceRange, dedupState);
                 result.mapSceneId(rawSceneId, previousOpenScene.scene());
                 result.lastTouchedScene = previousOpenScene.scene();
                 continue;
@@ -340,7 +353,7 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
             String summary = textOrDefault(sceneNode, "summary", "");
             ScriptScene similar = findSimilarScene(chapter.getId(), summary, dedupState);
             if (similar != null) {
-                mergeScene(similar, sceneNode, chapter, chunk, currentSceneNumber, totalScenes, dedupState);
+                mergeScene(similar, sceneNode, chapter, chunk, sourceRange, dedupState);
                 result.mapSceneId(rawSceneId, similar);
                 result.lastTouchedScene = similar;
                 continue;
@@ -362,7 +375,7 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
             scene.setSummary(summary);
             scene.setCharactersJson(writeJson(asArray(sceneNode.get("characters"))));
             scene.setBeatsJson(writeJson(beats));
-            scene.setSourceRefsJson(writeJson(resolveSourceRefs(sceneNode, chapter, chunk, currentSceneNumber, totalScenes)));
+            scene.setSourceRefsJson(writeJson(sourceRefsFromRange(chapter, chunk, sourceRange)));
             scene.setCreatedAt(now);
             scene.setUpdatedAt(now);
             sceneMapper.insert(scene);
@@ -465,7 +478,7 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
     }
 
     private void mergeScene(ScriptScene target, JsonNode sceneNode, NovelChapter chapter, NovelChunk chunk,
-                            int sceneNumber, int totalScenes, DedupState dedupState) {
+                            SourceRange sourceRange, DedupState dedupState) {
         ArrayNode mergedBeats = asArray(readJson(target.getBeatsJson()));
         ArrayNode newBeats = filterDialogueDuplicates(asArray(sceneNode.get("beats")), chapter.getId(), dedupState);
         newBeats.forEach(mergedBeats::add);
@@ -474,7 +487,7 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
         appendUniqueCharacters(mergedCharacters, asArray(sceneNode.get("characters")));
 
         ArrayNode mergedSources = asArray(readJson(target.getSourceRefsJson()));
-        appendUniqueJson(mergedSources, resolveSourceRefs(sceneNode, chapter, chunk, sceneNumber, totalScenes));
+        appendUniqueJson(mergedSources, sourceRefsFromRange(chapter, chunk, sourceRange));
 
         target.setBeatsJson(writeJson(mergedBeats));
         target.setCharactersJson(writeJson(mergedCharacters));
@@ -680,22 +693,84 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
         }
     }
 
-    private ArrayNode resolveSourceRefs(JsonNode sceneNode, NovelChapter chapter, NovelChunk chunk, int sceneNumber, int totalScenes) {
-        ArrayNode sourceRefs = asArray(sceneNode.get("source_refs"));
+    private List<SourceRange> resolveChunkSceneRanges(ArrayNode scenes, NovelChunk chunk) {
         SourceRange chunkRange = chunkSourceRange(chunk);
-        if (!sourceRefs.isEmpty()) {
-            ArrayNode normalized = objectMapper.createArrayNode();
-            for (JsonNode ref : sourceRefs) {
-                SourceRange aiRange = sourceRange(ref, chunkRange);
-                normalized.add(sourceRef(chapter, chunk, aiRange.isWholeChunk(chunkRange)
-                        ? inferSceneSourceRange(sceneNode, chunk, sceneNumber, totalScenes)
-                        : aiRange));
-            }
-            return normalized;
+        int totalScenes = Math.max(1, scenes.size());
+        if (totalScenes == 1) {
+            JsonNode sceneNode = scenes.isEmpty() ? objectMapper.createObjectNode() : scenes.get(0);
+            return List.of(resolveInitialSceneRange(sceneNode, chunk, 1, 1).clamp(chunkRange));
         }
-        ArrayNode fallback = objectMapper.createArrayNode();
-        fallback.add(sourceRef(chapter, chunk, inferSceneSourceRange(sceneNode, chunk, sceneNumber, totalScenes)));
-        return fallback;
+
+        List<SourceRange> ranges = new ArrayList<>();
+        int sceneNumber = 1;
+        for (JsonNode sceneNode : scenes) {
+            ranges.add(resolveInitialSceneRange(sceneNode, chunk, sceneNumber, totalScenes).clamp(chunkRange));
+            sceneNumber++;
+        }
+        return smoothChunkSceneRanges(ranges, chunkRange);
+    }
+
+    private SourceRange resolveInitialSceneRange(JsonNode sceneNode, NovelChunk chunk, int sceneNumber, int totalScenes) {
+        SourceRange chunkRange = chunkSourceRange(chunk);
+        SourceRange aiRange = mergeSourceRefs(asArray(sceneNode.get("source_refs")), chunkRange);
+        if (aiRange != null && !aiRange.isDegenerateForChunk(chunkRange) && !isSuspiciouslyNarrow(aiRange, sceneNode, chunkRange, totalScenes)) {
+            return aiRange;
+        }
+        return inferSceneSourceRange(sceneNode, chunk, sceneNumber, totalScenes);
+    }
+
+    private SourceRange mergeSourceRefs(ArrayNode sourceRefs, SourceRange chunkRange) {
+        SourceRange range = null;
+        for (JsonNode ref : sourceRefs) {
+            range = mergeRange(range, sourceRange(ref, chunkRange));
+        }
+        return range == null ? null : range.clamp(chunkRange);
+    }
+
+    private boolean isSuspiciouslyNarrow(SourceRange range, JsonNode sceneNode, SourceRange chunkRange, int totalScenes) {
+        if (totalScenes <= 1 || range.size() > 1 || chunkRange.size() <= totalScenes * 2) {
+            return false;
+        }
+        int meaningfulBeats = 0;
+        for (JsonNode beat : asArray(sceneNode.get("beats"))) {
+            if (hasMeaningfulText(beatText(beat))) {
+                meaningfulBeats++;
+            }
+        }
+        return meaningfulBeats >= 2;
+    }
+
+    private List<SourceRange> smoothChunkSceneRanges(List<SourceRange> ranges, SourceRange chunkRange) {
+        List<SourceRange> smoothed = new ArrayList<>();
+        int totalScenes = ranges.size();
+        int previousStart = chunkRange.start();
+        for (int i = 0; i < totalScenes; i++) {
+            SourceRange range = ranges.get(i).clamp(chunkRange);
+            if (range.isDegenerateForChunk(chunkRange)) {
+                range = fallbackSceneRange(chunkRange, i + 1, totalScenes);
+            }
+            SourceRange fallback = fallbackSceneRange(chunkRange, i + 1, totalScenes);
+            if (range.size() == 1 && fallback.size() > 1) {
+                int expandedStart = Math.min(range.start(), fallback.start());
+                int expandedEnd = Math.max(range.end(), Math.min(fallback.end(), range.end() + Math.max(1, fallback.size() / 2)));
+                range = new SourceRange(expandedStart, expandedEnd);
+            }
+            if (i > 0 && range.end() < previousStart) {
+                range = fallback;
+            } else if (i > 0 && range.start() < previousStart && range.end() >= previousStart) {
+                range = new SourceRange(previousStart, range.end());
+            }
+            range = range.clamp(chunkRange);
+            smoothed.add(range);
+            previousStart = Math.max(previousStart, range.start());
+        }
+        return smoothed;
+    }
+
+    private ArrayNode sourceRefsFromRange(NovelChapter chapter, NovelChunk chunk, SourceRange sourceRange) {
+        ArrayNode sourceRefs = objectMapper.createArrayNode();
+        sourceRefs.add(sourceRef(chapter, chunk, sourceRange.clamp(chunkSourceRange(chunk))));
+        return sourceRefs;
     }
 
     private SourceRange inferSceneSourceRange(JsonNode sceneNode, NovelChunk chunk, int sceneNumber, int totalScenes) {
@@ -734,8 +809,8 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
     }
 
     private SourceRange matchTextRange(String text, List<String> paragraphs, int paragraphOffset) {
-        String normalizedText = normalize(text);
-        if (!StringUtils.hasText(normalizedText)) {
+        List<String> fragments = matchFragments(text);
+        if (fragments.isEmpty()) {
             return null;
         }
         SourceRange range = null;
@@ -744,12 +819,43 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
             if (!StringUtils.hasText(normalizedParagraph)) {
                 continue;
             }
-            if (normalizedParagraph.contains(normalizedText) || normalizedText.contains(normalizedParagraph)) {
-                int paragraphNumber = paragraphOffset + i;
-                range = mergeRange(range, new SourceRange(paragraphNumber, paragraphNumber));
+            for (String fragment : fragments) {
+                if (normalizedParagraph.contains(fragment) || fragment.contains(normalizedParagraph)) {
+                    int paragraphNumber = paragraphOffset + i;
+                    range = mergeRange(range, new SourceRange(paragraphNumber, paragraphNumber));
+                    break;
+                }
             }
         }
         return range;
+    }
+
+    private List<String> matchFragments(String text) {
+        String normalizedText = normalize(text);
+        if (!StringUtils.hasText(normalizedText)) {
+            return List.of();
+        }
+        LinkedHashSet<String> fragments = new LinkedHashSet<>();
+        if (normalizedText.length() >= 4) {
+            fragments.add(normalizedText);
+        }
+        for (String part : text.split("[，。！？；、,.!?;：:“”\"'（）()《》【】\\s]+")) {
+            String normalizedPart = normalize(part);
+            if (normalizedPart.length() >= 6) {
+                fragments.add(normalizedPart);
+            }
+        }
+        int window = Math.min(14, normalizedText.length());
+        if (window >= 8) {
+            int step = Math.max(4, window / 2);
+            for (int start = 0; start + window <= normalizedText.length(); start += step) {
+                fragments.add(normalizedText.substring(start, start + window));
+            }
+            if (normalizedText.length() > window) {
+                fragments.add(normalizedText.substring(normalizedText.length() - window));
+            }
+        }
+        return new ArrayList<>(fragments);
     }
 
     private SourceRange fallbackSceneRange(SourceRange chunkRange, int sceneNumber, int totalScenes) {
@@ -918,6 +1024,30 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
         return StringUtils.hasText(value.replaceAll("[\\s\\p{Punct}，。！？、；：“”‘’（）《》【】—…-]+", ""));
     }
 
+    private boolean isDirectQuotedDialogue(String text, NovelChunk chunk) {
+        String normalizedText = normalize(text);
+        if (!StringUtils.hasText(normalizedText) || chunk == null || !StringUtils.hasText(chunk.getContent())) {
+            return false;
+        }
+        Matcher matcher = DIRECT_QUOTE_PATTERN.matcher(chunk.getContent());
+        while (matcher.find()) {
+            String quoted = normalize(matcher.group(1));
+            if (!StringUtils.hasText(quoted)) {
+                continue;
+            }
+            if (quoted.contains(normalizedText) || normalizedText.contains(quoted)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private String indirectDialogueActionText(String characterName, String text) {
+        String speaker = StringUtils.hasText(characterName) ? characterName.trim() : "角色";
+        String content = StringUtils.hasText(text) ? text.trim() : "相关内容";
+        return speaker + "进行交流，原文以间接叙述呈现：" + content;
+    }
+
     private String normalizeBeatType(String type) {
         if ("dialogue".equals(type) || "transition".equals(type)) {
             return type;
@@ -1035,8 +1165,18 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
             return Math.max(1, end - start + 1);
         }
 
-        private boolean isWholeChunk(SourceRange chunkRange) {
-            return start <= chunkRange.start() && end >= chunkRange.end();
+        private boolean isDegenerateForChunk(SourceRange chunkRange) {
+            if (start <= chunkRange.start() && end >= chunkRange.end()) {
+                return true;
+            }
+            if (chunkRange.size() <= 1) {
+                return false;
+            }
+            double coverage = (double) clamp(chunkRange).size() / chunkRange.size();
+            if (coverage >= 0.8) {
+                return true;
+            }
+            return start <= chunkRange.start() && end >= chunkRange.end() - 1;
         }
 
         private SourceRange clamp(SourceRange chunkRange) {

@@ -27,7 +27,9 @@ public class DeepSeekPromptConst {
             如果当前 chunk 开头延续上一 chunk 的未结束场景，当前 chunk 的第一个 scene 可以设置 is_continuation=true，并填写 continuation_of 和 continuation_reason。
             只有同一章节、同一地点或时间连续、人物和冲突连续时，才允许标记 continuation。
             beats 只能包含 type 为 action、dialogue、transition 的对象。
-            dialogue beat 必须包含 character_name 和 text，text 必须保留原文中直接说出口的对白，不要遗漏当前 chunk 内任何直接对白。
+            dialogue beat 必须包含 character_name 和 text，text 必须保留原文中用引号直接说出口的对白，不要遗漏当前 chunk 内任何直接对白。
+            只有原文中以“”、""、「」、『』、‘’包裹并明确由角色说出口的内容，才允许输出为 dialogue。
+            “某人问他是否……”“他说没有”“她告诉他……”“他提到……”这类间接叙述必须输出为 action，不得改写成 dialogue。
             action 和 transition beat 必须包含非空 text；action.text 必须是一句具体可视化的中文动作、环境变化或人物反应，不能为空、不能只写标点。
             对白之间的重要动作、表情和情绪转折必须保留为 action，例如“脚步骤停”“瞳孔骤缩”“捧起灵牌”“掷出残剑”。
             信件、纸条、日记、终端消息、通讯内容如果原文没有明确说出口或朗读，不要改写为 dialogue；请用 action 描述“某某读到/看到……”。
@@ -66,7 +68,7 @@ public class DeepSeekPromptConst {
      * 首次生成时使用的质量提示。
      */
     public static final String DEFAULT_QUALITY_INSTRUCTION = """
-            请优先保证 action.text 非空、直接对白完整、叙事内容不要误转对白。
+            请优先保证 action.text 非空、直接对白完整、叙事内容不要误转对白；没有原文引号包裹的间接叙述不得输出为 dialogue。
             """;
 
     /**
@@ -74,6 +76,6 @@ public class DeepSeekPromptConst {
      */
     public static final String RETRY_QUALITY_INSTRUCTION_TEMPLATE = """
             上一次输出未通过后端质量校验：%s。
-            请重新抽取当前 chunk：每个 scene 必须包含有效 beats；action/transition text 不得为空；保留所有直接对白；不要把默读的信件、消息或日记转成 dialogue。
+            请重新抽取当前 chunk：每个 scene 必须包含有效 beats；action/transition text 不得为空；保留所有带引号的直接对白；不要把默读的信件、消息、日记或“某人问/他说/她告诉”这类间接叙述转成 dialogue。
             """;
 }
