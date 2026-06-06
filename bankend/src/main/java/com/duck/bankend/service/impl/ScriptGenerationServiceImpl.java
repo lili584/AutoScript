@@ -318,14 +318,16 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
     private SaveScenesResult saveScenes(Novel novel, NovelChapter chapter, NovelChunk chunk, JsonNode scenes,
                                         OpenSceneRef previousOpenScene, DedupState dedupState) {
         SaveScenesResult result = new SaveScenesResult();
+        int totalScenes = Math.max(1, asArray(scenes).size());
         int sceneNumber = 1;
         for (JsonNode sceneNode : scenes) {
+            int currentSceneNumber = sceneNumber;
             String rawSceneId = textOrDefault(sceneNode, "scene_id", "scene-%d".formatted(sceneNumber));
             String sceneId = buildSceneId(sceneNode, chunk, sceneNumber);
             sceneNumber++;
 
             if (sceneNumber == 2 && canMergeContinuation(sceneNode, chapter, chunk, previousOpenScene)) {
-                mergeScene(previousOpenScene.scene(), sceneNode, chapter, chunk, dedupState);
+                mergeScene(previousOpenScene.scene(), sceneNode, chapter, chunk, currentSceneNumber, totalScenes, dedupState);
                 result.mapSceneId(rawSceneId, previousOpenScene.scene());
                 result.lastTouchedScene = previousOpenScene.scene();
                 continue;
@@ -338,7 +340,7 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
             String summary = textOrDefault(sceneNode, "summary", "");
             ScriptScene similar = findSimilarScene(chapter.getId(), summary, dedupState);
             if (similar != null) {
-                mergeScene(similar, sceneNode, chapter, chunk, dedupState);
+                mergeScene(similar, sceneNode, chapter, chunk, currentSceneNumber, totalScenes, dedupState);
                 result.mapSceneId(rawSceneId, similar);
                 result.lastTouchedScene = similar;
                 continue;
@@ -360,7 +362,7 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
             scene.setSummary(summary);
             scene.setCharactersJson(writeJson(asArray(sceneNode.get("characters"))));
             scene.setBeatsJson(writeJson(beats));
-            scene.setSourceRefsJson(writeJson(resolveSourceRefs(sceneNode, chapter, chunk)));
+            scene.setSourceRefsJson(writeJson(resolveSourceRefs(sceneNode, chapter, chunk, currentSceneNumber, totalScenes)));
             scene.setCreatedAt(now);
             scene.setUpdatedAt(now);
             sceneMapper.insert(scene);
@@ -462,7 +464,8 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
         return names;
     }
 
-    private void mergeScene(ScriptScene target, JsonNode sceneNode, NovelChapter chapter, NovelChunk chunk, DedupState dedupState) {
+    private void mergeScene(ScriptScene target, JsonNode sceneNode, NovelChapter chapter, NovelChunk chunk,
+                            int sceneNumber, int totalScenes, DedupState dedupState) {
         ArrayNode mergedBeats = asArray(readJson(target.getBeatsJson()));
         ArrayNode newBeats = filterDialogueDuplicates(asArray(sceneNode.get("beats")), chapter.getId(), dedupState);
         newBeats.forEach(mergedBeats::add);
@@ -471,7 +474,7 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
         appendUniqueCharacters(mergedCharacters, asArray(sceneNode.get("characters")));
 
         ArrayNode mergedSources = asArray(readJson(target.getSourceRefsJson()));
-        appendUniqueJson(mergedSources, resolveSourceRefs(sceneNode, chapter, chunk));
+        appendUniqueJson(mergedSources, resolveSourceRefs(sceneNode, chapter, chunk, sceneNumber, totalScenes));
 
         target.setBeatsJson(writeJson(mergedBeats));
         target.setCharactersJson(writeJson(mergedCharacters));
@@ -677,29 +680,139 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
         }
     }
 
-    private ArrayNode resolveSourceRefs(JsonNode sceneNode, NovelChapter chapter, NovelChunk chunk) {
+    private ArrayNode resolveSourceRefs(JsonNode sceneNode, NovelChapter chapter, NovelChunk chunk, int sceneNumber, int totalScenes) {
         ArrayNode sourceRefs = asArray(sceneNode.get("source_refs"));
+        SourceRange chunkRange = chunkSourceRange(chunk);
         if (!sourceRefs.isEmpty()) {
             ArrayNode normalized = objectMapper.createArrayNode();
             for (JsonNode ref : sourceRefs) {
-                normalized.add(sourceRef(ref, chapter, chunk));
+                SourceRange aiRange = sourceRange(ref, chunkRange);
+                normalized.add(sourceRef(chapter, chunk, aiRange.isWholeChunk(chunkRange)
+                        ? inferSceneSourceRange(sceneNode, chunk, sceneNumber, totalScenes)
+                        : aiRange));
             }
             return normalized;
         }
         ArrayNode fallback = objectMapper.createArrayNode();
-        fallback.add(sourceRef(null, chapter, chunk));
+        fallback.add(sourceRef(chapter, chunk, inferSceneSourceRange(sceneNode, chunk, sceneNumber, totalScenes)));
         return fallback;
     }
 
-    private ObjectNode sourceRef(JsonNode ref, NovelChapter chapter, NovelChunk chunk) {
+    private SourceRange inferSceneSourceRange(JsonNode sceneNode, NovelChunk chunk, int sceneNumber, int totalScenes) {
+        List<String> paragraphs = splitChunkParagraphs(chunk);
+        SourceRange chunkRange = chunkSourceRange(chunk);
+        if (paragraphs.isEmpty()) {
+            return chunkRange;
+        }
+
+        SourceRange matchedRange = matchSceneRange(sceneNode, paragraphs, chunkRange.start());
+        if (matchedRange != null) {
+            return matchedRange.clamp(chunkRange);
+        }
+        return fallbackSceneRange(chunkRange, sceneNumber, totalScenes);
+    }
+
+    private SourceRange matchSceneRange(JsonNode sceneNode, List<String> paragraphs, int paragraphOffset) {
+        SourceRange dialogueRange = null;
+        SourceRange actionRange = null;
+        for (JsonNode beat : asArray(sceneNode.get("beats"))) {
+            String text = beatText(beat);
+            if (!hasMeaningfulText(text)) {
+                continue;
+            }
+            SourceRange range = matchTextRange(text, paragraphs, paragraphOffset);
+            if (range == null) {
+                continue;
+            }
+            if ("dialogue".equals(beat.path("type").asText())) {
+                dialogueRange = mergeRange(dialogueRange, range);
+            } else {
+                actionRange = mergeRange(actionRange, range);
+            }
+        }
+        return dialogueRange == null ? actionRange : mergeRange(dialogueRange, actionRange);
+    }
+
+    private SourceRange matchTextRange(String text, List<String> paragraphs, int paragraphOffset) {
+        String normalizedText = normalize(text);
+        if (!StringUtils.hasText(normalizedText)) {
+            return null;
+        }
+        SourceRange range = null;
+        for (int i = 0; i < paragraphs.size(); i++) {
+            String normalizedParagraph = normalize(paragraphs.get(i));
+            if (!StringUtils.hasText(normalizedParagraph)) {
+                continue;
+            }
+            if (normalizedParagraph.contains(normalizedText) || normalizedText.contains(normalizedParagraph)) {
+                int paragraphNumber = paragraphOffset + i;
+                range = mergeRange(range, new SourceRange(paragraphNumber, paragraphNumber));
+            }
+        }
+        return range;
+    }
+
+    private SourceRange fallbackSceneRange(SourceRange chunkRange, int sceneNumber, int totalScenes) {
+        if (totalScenes <= 1 || chunkRange.size() <= 1) {
+            return chunkRange;
+        }
+        int scenes = Math.max(1, totalScenes);
+        int index = Math.max(1, Math.min(sceneNumber, scenes)) - 1;
+        int start = chunkRange.start() + (int) Math.floor((double) chunkRange.size() * index / scenes);
+        int nextStart = chunkRange.start() + (int) Math.floor((double) chunkRange.size() * (index + 1) / scenes);
+        int end = Math.max(start, nextStart - 1);
+        if (index == scenes - 1) {
+            end = chunkRange.end();
+        }
+        return new SourceRange(start, Math.min(end, chunkRange.end()));
+    }
+
+    private SourceRange mergeRange(SourceRange left, SourceRange right) {
+        if (left == null) {
+            return right;
+        }
+        if (right == null) {
+            return left;
+        }
+        return new SourceRange(Math.min(left.start(), right.start()), Math.max(left.end(), right.end()));
+    }
+
+    private List<String> splitChunkParagraphs(NovelChunk chunk) {
+        if (!StringUtils.hasText(chunk.getContent())) {
+            return List.of();
+        }
+        List<String> paragraphs = new ArrayList<>();
+        for (String paragraph : chunk.getContent().trim().split("\\n\\s*\\n+")) {
+            if (StringUtils.hasText(paragraph)) {
+                paragraphs.add(paragraph.trim());
+            }
+        }
+        return paragraphs;
+    }
+
+    private SourceRange sourceRange(JsonNode ref, SourceRange fallback) {
+        if (ref == null) {
+            return fallback;
+        }
+        return new SourceRange(
+                ref.path("paragraph_start").asInt(fallback.start()),
+                ref.path("paragraph_end").asInt(fallback.end())
+        ).clamp(fallback);
+    }
+
+    private SourceRange chunkSourceRange(NovelChunk chunk) {
         int paragraphStart = chunk.getParagraphStart() == null ? 0 : chunk.getParagraphStart();
         int paragraphEnd = chunk.getParagraphEnd() == null ? paragraphStart : chunk.getParagraphEnd();
+        return new SourceRange(paragraphStart, Math.max(paragraphStart, paragraphEnd));
+    }
+
+    private ObjectNode sourceRef(NovelChapter chapter, NovelChunk chunk, SourceRange range) {
         ObjectNode source = objectMapper.createObjectNode();
         source.put("chapter_index", chunk.getChapterIndex());
         source.put("chapter_title", chapter.getTitle());
         source.put("chunk_index", chunk.getChunkIndex());
-        source.put("paragraph_start", ref == null ? paragraphStart : ref.path("paragraph_start").asInt(paragraphStart));
-        source.put("paragraph_end", ref == null ? paragraphEnd : ref.path("paragraph_end").asInt(paragraphEnd));
+        source.put("paragraph_start", range.start());
+        source.put("paragraph_end", range.end());
         return source;
     }
 
@@ -914,6 +1027,23 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
     }
 
     private record SanitizedScene(ObjectNode scene, int rawActionCount, int emptyActionCount, int validActionCount, int dialogueCount) {
+    }
+
+    private record SourceRange(int start, int end) {
+
+        private int size() {
+            return Math.max(1, end - start + 1);
+        }
+
+        private boolean isWholeChunk(SourceRange chunkRange) {
+            return start <= chunkRange.start() && end >= chunkRange.end();
+        }
+
+        private SourceRange clamp(SourceRange chunkRange) {
+            int clampedStart = Math.max(chunkRange.start(), Math.min(start, chunkRange.end()));
+            int clampedEnd = Math.max(clampedStart, Math.min(end, chunkRange.end()));
+            return new SourceRange(clampedStart, clampedEnd);
+        }
     }
 
     private static class DedupState {
