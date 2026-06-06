@@ -18,6 +18,7 @@ import org.springframework.util.StringUtils;
 
 import java.text.Normalizer;
 import java.time.OffsetDateTime;
+import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -35,6 +36,9 @@ public class ScriptYamlExportServiceImpl implements ScriptYamlExportService {
     private static final String SOURCE_TYPE = "novel";
     private static final String LANGUAGE = "zh-CN";
     private static final String GENERATOR = "AutoScript";
+    private static final ZoneId EXPORT_ZONE = ZoneId.of("Asia/Shanghai");
+    private static final DateTimeFormatter METADATA_TIME_FORMATTER = DateTimeFormatter.ISO_OFFSET_DATE_TIME;
+    private static final DateTimeFormatter FILE_TIME_FORMATTER = DateTimeFormatter.ofPattern("yyyyMMddHHmm");
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
@@ -50,8 +54,9 @@ public class ScriptYamlExportServiceImpl implements ScriptYamlExportService {
         if (scenes.isEmpty()) {
             throw new IllegalArgumentException("暂无 AI 场景草稿，请先完成 AI 分析");
         }
-        String fileName = safeFileName(novel.getTitle()) + "-剧本.yaml";
-        return new ScriptYamlPreview(fileName, buildYaml(novel, chapters, scenes));
+        OffsetDateTime exportTime = OffsetDateTime.now(EXPORT_ZONE);
+        String fileName = safeFileName(novel.getTitle()) + "-剧本-" + exportTime.format(FILE_TIME_FORMATTER) + ".yaml";
+        return new ScriptYamlPreview(fileName, buildYaml(novel, chapters, scenes, exportTime));
     }
 
     @Override
@@ -86,12 +91,12 @@ public class ScriptYamlExportServiceImpl implements ScriptYamlExportService {
         return scenes;
     }
 
-    private String buildYaml(Novel novel, List<NovelChapter> chapters, List<ScriptScene> scenes) {
+    private String buildYaml(Novel novel, List<NovelChapter> chapters, List<ScriptScene> scenes, OffsetDateTime exportTime) {
         Map<String, CharacterDraft> characters = collectCharacters(scenes);
         StringBuilder yaml = new StringBuilder();
         line(yaml, 0, "schema_version: " + scalar(SCHEMA_VERSION));
         blank(yaml);
-        writeMetadata(yaml, novel);
+        writeMetadata(yaml, novel, exportTime);
         blank(yaml);
         writeSource(yaml, novel, chapters);
         blank(yaml);
@@ -101,12 +106,12 @@ public class ScriptYamlExportServiceImpl implements ScriptYamlExportService {
         return yaml.toString();
     }
 
-    private void writeMetadata(StringBuilder yaml, Novel novel) {
+    private void writeMetadata(StringBuilder yaml, Novel novel, OffsetDateTime exportTime) {
         line(yaml, 0, "metadata:");
         line(yaml, 1, "title: " + scalar(novel.getTitle()));
         line(yaml, 1, "source_type: " + scalar(SOURCE_TYPE));
         line(yaml, 1, "language: " + scalar(LANGUAGE));
-        line(yaml, 1, "generated_at: " + scalar(OffsetDateTime.now().format(DateTimeFormatter.ISO_OFFSET_DATE_TIME)));
+        line(yaml, 1, "generated_at: " + scalar(exportTime.format(METADATA_TIME_FORMATTER)));
         line(yaml, 1, "generator: " + scalar(GENERATOR));
     }
 
@@ -188,7 +193,7 @@ public class ScriptYamlExportServiceImpl implements ScriptYamlExportService {
         }
         line(yaml, 2, "beats:");
         for (JsonNode beat : beats) {
-            String type = textOrDefault(beat, "type", "action");
+            String type = normalizeBeatType(textOrDefault(beat, "type", "action"));
             line(yaml, 3, "- type: " + scalar(type));
             if ("dialogue".equals(type)) {
                 String characterName = dialogueCharacter(beat);
@@ -310,6 +315,13 @@ public class ScriptYamlExportServiceImpl implements ScriptYamlExportService {
 
     private String normalizeNameKey(String name) {
         return StringUtils.hasText(name) ? name.trim().toLowerCase() : "";
+    }
+
+    private String normalizeBeatType(String type) {
+        if ("dialogue".equals(type) || "transition".equals(type)) {
+            return type;
+        }
+        return "action";
     }
 
     private String normalizeIdPart(String value) {

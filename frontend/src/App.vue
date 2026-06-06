@@ -506,7 +506,7 @@ async function downloadYaml() {
     const url = window.URL.createObjectURL(blob)
     const link = document.createElement('a')
     link.href = url
-    link.download = yamlFileName.value || `${selectedNovel.value?.title || '剧本'}-剧本.yaml`
+    link.download = extractDownloadFileName(response) || yamlFileName.value || `${selectedNovel.value?.title || '剧本'}-剧本.yaml`
     document.body.appendChild(link)
     link.click()
     link.remove()
@@ -517,6 +517,30 @@ async function downloadYaml() {
   } finally {
     saving.value = false
   }
+}
+
+function extractDownloadFileName(response) {
+  const disposition = response.headers.get('Content-Disposition') || response.headers.get('content-disposition')
+  if (!disposition) {
+    return ''
+  }
+
+  const encodedMatch = disposition.match(/filename\*=UTF-8''([^;]+)/i)
+  if (encodedMatch?.[1]) {
+    try {
+      return decodeURIComponent(encodedMatch[1])
+    } catch {
+      return encodedMatch[1]
+    }
+  }
+
+  const quotedMatch = disposition.match(/filename="([^"]+)"/i)
+  if (quotedMatch?.[1]) {
+    return quotedMatch[1]
+  }
+
+  const plainMatch = disposition.match(/filename=([^;]+)/i)
+  return plainMatch?.[1]?.trim() || ''
 }
 
 function taskStatusText(status) {
