@@ -1,6 +1,7 @@
 package com.duck.bankend.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.duck.bankend.constant.NovelChunkingConst;
 import com.duck.bankend.mapper.NovelChapterMapper;
 import com.duck.bankend.mapper.NovelChunkMapper;
 import com.duck.bankend.model.dto.NovelChapterView;
@@ -29,12 +30,7 @@ import java.util.regex.Pattern;
 @RequiredArgsConstructor
 public class NovelStructureServiceImpl implements NovelStructureService {
 
-    private static final int MIN_CHUNK_LENGTH = 1500;
-    private static final int MAX_CHUNK_LENGTH = 2000;
-    private static final int MIN_CONTEXT_LENGTH = 300;
-    private static final int MAX_CONTEXT_LENGTH = 800;
-    private static final int MAX_CONTEXT_PARAGRAPHS = 6;
-    private static final Pattern CHAPTER_HEADING_PATTERN = Pattern.compile("(?m)^##\\s+(.+)$");
+    private static final Pattern CHAPTER_HEADING_PATTERN = Pattern.compile(NovelChunkingConst.CHAPTER_HEADING_REGEX);
 
     private final NovelService novelService;
     private final NovelChapterMapper chapterMapper;
@@ -161,7 +157,7 @@ public class NovelStructureServiceImpl implements NovelStructureService {
             if (current.isEmpty()) {
                 current.add(new ParagraphRef(i + 1, paragraph));
                 currentLength = paragraphLength;
-                if (paragraphLength > MAX_CHUNK_LENGTH) {
+                if (paragraphLength > NovelChunkingConst.MAX_CHUNK_LENGTH) {
                     addChunk(chunks, current);
                     current = new ArrayList<>();
                     currentLength = 0;
@@ -169,7 +165,7 @@ public class NovelStructureServiceImpl implements NovelStructureService {
                 continue;
             }
 
-            if (nextLength <= MAX_CHUNK_LENGTH) {
+            if (nextLength <= NovelChunkingConst.MAX_CHUNK_LENGTH) {
                 current.add(new ParagraphRef(i + 1, paragraph));
                 currentLength = nextLength;
                 continue;
@@ -179,7 +175,7 @@ public class NovelStructureServiceImpl implements NovelStructureService {
             current = new ArrayList<>();
             current.add(new ParagraphRef(i + 1, paragraph));
             currentLength = paragraphLength;
-            if (paragraphLength > MAX_CHUNK_LENGTH) {
+            if (paragraphLength > NovelChunkingConst.MAX_CHUNK_LENGTH) {
                 addChunk(chunks, current);
                 current = new ArrayList<>();
                 currentLength = 0;
@@ -218,20 +214,20 @@ public class NovelStructureServiceImpl implements NovelStructureService {
 
         List<String> selected = new ArrayList<>();
         int totalLength = 0;
-        for (int i = previousParagraphs.size() - 1; i >= 0 && selected.size() < MAX_CONTEXT_PARAGRAPHS; i--) {
+        for (int i = previousParagraphs.size() - 1; i >= 0 && selected.size() < NovelChunkingConst.MAX_CONTEXT_PARAGRAPHS; i--) {
             String paragraph = previousParagraphs.get(i).text();
             selected.add(0, paragraph);
             totalLength += paragraph.length();
-            if (totalLength >= MIN_CONTEXT_LENGTH) {
+            if (totalLength >= NovelChunkingConst.MIN_CONTEXT_LENGTH) {
                 break;
             }
         }
 
         String context = String.join("\n\n", selected);
-        if (context.length() <= MAX_CONTEXT_LENGTH) {
+        if (context.length() <= NovelChunkingConst.MAX_CONTEXT_LENGTH) {
             return context;
         }
-        return context.substring(context.length() - MAX_CONTEXT_LENGTH).trim();
+        return context.substring(context.length() - NovelChunkingConst.MAX_CONTEXT_LENGTH).trim();
     }
 
     private NovelParseResult buildParseResult(Long novelId) {

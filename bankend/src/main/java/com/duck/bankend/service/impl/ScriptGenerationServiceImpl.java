@@ -1,6 +1,10 @@
 package com.duck.bankend.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.duck.bankend.client.DeepSeekSceneClient;
+import com.duck.bankend.client.DeepSeekSceneClient.SceneExtractionResult;
+import com.duck.bankend.constant.ScriptGenerationConst;
+import com.duck.bankend.constant.ScriptGenerationStatusConst;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
@@ -21,8 +25,6 @@ import com.duck.bankend.model.entity.ScriptChapterState;
 import com.duck.bankend.model.entity.ScriptDialogue;
 import com.duck.bankend.model.entity.ScriptGenerationTask;
 import com.duck.bankend.model.entity.ScriptScene;
-import com.duck.bankend.service.DeepSeekSceneClient;
-import com.duck.bankend.service.DeepSeekSceneClient.SceneExtractionResult;
 import com.duck.bankend.service.NovelService;
 import com.duck.bankend.service.ScriptGenerationService;
 import jakarta.annotation.PreDestroy;
@@ -45,11 +47,6 @@ import java.util.concurrent.Executors;
 @Service
 @RequiredArgsConstructor
 public class ScriptGenerationServiceImpl implements ScriptGenerationService {
-
-    private static final String STATUS_PENDING = "pending";
-    private static final String STATUS_RUNNING = "running";
-    private static final String STATUS_SUCCEEDED = "succeeded";
-    private static final String STATUS_FAILED = "failed";
 
     private final ExecutorService executorService = Executors.newSingleThreadExecutor();
     private final ObjectMapper objectMapper = new ObjectMapper();
@@ -83,7 +80,7 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
         LocalDateTime now = LocalDateTime.now();
         ScriptGenerationTask task = new ScriptGenerationTask();
         task.setNovelId(novelId);
-        task.setStatus(STATUS_PENDING);
+        task.setStatus(ScriptGenerationStatusConst.PENDING);
         task.setTotalChunks(chunks.size());
         task.setProcessedChunks(0);
         task.setCreatedAt(now);
@@ -136,7 +133,7 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
         }
 
         try {
-            updateTaskStatus(task, STATUS_RUNNING, null);
+            updateTaskStatus(task, ScriptGenerationStatusConst.RUNNING, null);
             Novel novel = novelService.getActiveNovel(task.getNovelId());
             Map<Long, NovelChapter> chapters = loadChapters(task.getNovelId());
             List<NovelChunk> chunks = loadChunks(task.getNovelId());
@@ -172,9 +169,9 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
                 previousOpenScene = resolveOpenScene(previousChapterState, saveResult, chapter, chunk);
                 incrementProgress(task);
             }
-            updateTaskStatus(task, STATUS_SUCCEEDED, null);
+            updateTaskStatus(task, ScriptGenerationStatusConst.SUCCEEDED, null);
         } catch (Exception exception) {
-            updateTaskStatus(task, STATUS_FAILED, exception.getMessage());
+            updateTaskStatus(task, ScriptGenerationStatusConst.FAILED, exception.getMessage());
         }
     }
 
@@ -237,7 +234,7 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
             return null;
         }
         for (ScriptScene scene : dedupState.scenesByChapter.getOrDefault(chapterId, List.of())) {
-            if (summarySimilarity(scene.getSummary(), summary) >= 0.9) {
+            if (summarySimilarity(scene.getSummary(), summary) >= ScriptGenerationConst.SUMMARY_SIMILARITY_THRESHOLD) {
                 return scene;
             }
         }
@@ -245,12 +242,12 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
     }
 
     private String buildSceneId(JsonNode sceneNode, NovelChunk chunk, int sceneNumber) {
-        String rawSceneId = textOrDefault(sceneNode, "scene_id", "scene-%d".formatted(sceneNumber));
+        String rawSceneId = textOrDefault(sceneNode, "scene_id", ScriptGenerationConst.DEFAULT_SCENE_ID_TEMPLATE.formatted(sceneNumber));
         String normalized = normalizeSceneId(rawSceneId);
-        if (normalized.matches("chapter-\\d+-chunk-\\d+-.+")) {
+        if (normalized.matches(ScriptGenerationConst.SCENE_ID_WITH_SOURCE_REGEX)) {
             return normalized;
         }
-        return "chapter-%d-chunk-%d-%s".formatted(chunk.getChapterIndex(), chunk.getChunkIndex(), normalized);
+        return ScriptGenerationConst.SCENE_ID_WITH_SOURCE_TEMPLATE.formatted(chunk.getChapterIndex(), chunk.getChunkIndex(), normalized);
     }
 
     private String normalizeSceneId(String sceneId) {
@@ -536,10 +533,10 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
         task.setStatus(status);
         task.setErrorMessage(errorMessage);
         LocalDateTime now = LocalDateTime.now();
-        if (STATUS_RUNNING.equals(status)) {
+        if (ScriptGenerationStatusConst.RUNNING.equals(status)) {
             task.setStartedAt(now);
         }
-        if (STATUS_SUCCEEDED.equals(status) || STATUS_FAILED.equals(status)) {
+        if (ScriptGenerationStatusConst.SUCCEEDED.equals(status) || ScriptGenerationStatusConst.FAILED.equals(status)) {
             task.setCompletedAt(now);
         }
         task.setUpdatedAt(now);
