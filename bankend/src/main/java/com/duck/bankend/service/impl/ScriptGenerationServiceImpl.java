@@ -5,6 +5,7 @@ import com.duck.bankend.client.DeepSeekSceneClient;
 import com.duck.bankend.client.DeepSeekSceneClient.SceneExtractionResult;
 import com.duck.bankend.constant.ScriptGenerationConst;
 import com.duck.bankend.constant.ScriptGenerationStatusConst;
+import com.duck.bankend.constant.DeepSeekPromptConst;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
@@ -27,6 +28,7 @@ import com.duck.bankend.model.entity.ScriptGenerationTask;
 import com.duck.bankend.model.entity.ScriptScene;
 import com.duck.bankend.service.NovelService;
 import com.duck.bankend.service.ScriptGenerationService;
+import com.duck.bankend.util.ScriptCharacterNameNormalizer;
 import jakarta.annotation.PreDestroy;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
@@ -153,9 +155,9 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
                     currentChapterId = chapter.getId();
                 }
 
-                SceneExtractionResult extraction;
+                QualityCheckedExtraction extraction;
                 try {
-                    extraction = deepSeekSceneClient.extractScenes(novel, chapter, chunk, previousChapterState);
+                    extraction = extractScenesWithQualityRetry(novel, chapter, chunk, previousChapterState);
                 } catch (Exception exception) {
                     throw new IllegalStateException("第 %d 章第 %d 个 chunk 分析失败: %s".formatted(
                             chunk.getChapterIndex(),
@@ -172,6 +174,144 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
             updateTaskStatus(task, ScriptGenerationStatusConst.SUCCEEDED, null);
         } catch (Exception exception) {
             updateTaskStatus(task, ScriptGenerationStatusConst.FAILED, exception.getMessage());
+        }
+    }
+
+    private QualityCheckedExtraction extractScenesWithQualityRetry(Novel novel, NovelChapter chapter, NovelChunk chunk,
+                                                                   JsonNode previousChapterState) {
+        QualityCheck lastQualityCheck = null;
+        for (int attempt = 0; attempt <= ScriptGenerationConst.MAX_QUALITY_RETRY; attempt++) {
+            String qualityInstruction = attempt == 0
+                    ? DeepSeekPromptConst.DEFAULT_QUALITY_INSTRUCTION
+                    : DeepSeekPromptConst.RETRY_QUALITY_INSTRUCTION_TEMPLATE.formatted(lastQualityCheck.message());
+            SceneExtractionResult extraction = deepSeekSceneClient.extractScenes(novel, chapter, chunk, previousChapterState, qualityInstruction);
+            QualityCheck qualityCheck = sanitizeAndCheckScenes(extraction.scenes());
+            if (qualityCheck.accepted()) {
+                return new QualityCheckedExtraction(qualityCheck.scenes(), extraction.chapterState());
+            }
+            lastQualityCheck = qualityCheck;
+        }
+        throw new IllegalStateException("AI 输出质量不合格: " + (lastQualityCheck == null ? "未知错误" : lastQualityCheck.message()));
+    }
+
+    private QualityCheck sanitizeAndCheckScenes(JsonNode rawScenes) {
+        ArrayNode sanitizedScenes = objectMapper.createArrayNode();
+        int rawSceneCount = 0;
+        int rawActionCount = 0;
+        int emptyActionCount = 0;
+        int validActionCount = 0;
+        int dialogueCount = 0;
+
+        for (JsonNode sceneNode : asArray(rawScenes)) {
+            rawSceneCount++;
+            SanitizedScene sanitizedScene = sanitizeScene(sceneNode);
+            rawActionCount += sanitizedScene.rawActionCount();
+            emptyActionCount += sanitizedScene.emptyActionCount();
+            validActionCount += sanitizedScene.validActionCount();
+            dialogueCount += sanitizedScene.dialogueCount();
+            if (sanitizedScene.scene() != null) {
+                sanitizedScenes.add(sanitizedScene.scene());
+            }
+        }
+
+        List<String> reasons = new ArrayList<>();
+        if (rawSceneCount == 0 || sanitizedScenes.isEmpty()) {
+            reasons.add("未生成有效 scene");
+        }
+        if (rawActionCount > 0) {
+            double emptyRatio = (double) emptyActionCount / rawActionCount;
+            if (emptyRatio > ScriptGenerationConst.MAX_EMPTY_ACTION_RATIO) {
+                reasons.add("action/transition 空文本比例过高 %d/%d".formatted(emptyActionCount, rawActionCount));
+            }
+        }
+        if (dialogueCount > 0 && validActionCount == 0) {
+            reasons.add("存在对白但没有任何有效 action");
+        }
+        return new QualityCheck(reasons.isEmpty(), sanitizedScenes, String.join("；", reasons));
+    }
+
+    private SanitizedScene sanitizeScene(JsonNode sceneNode) {
+        if (sceneNode == null || !sceneNode.isObject()) {
+            return new SanitizedScene(null, 0, 0, 0, 0);
+        }
+
+        ObjectNode scene = objectMapper.createObjectNode();
+        copyTextField(sceneNode, scene, "scene_id");
+        copyTextField(sceneNode, scene, "title");
+        copyTextField(sceneNode, scene, "location");
+        copyTextField(sceneNode, scene, "time_of_day");
+        copyTextField(sceneNode, scene, "summary");
+        copyTextField(sceneNode, scene, "continuation_of");
+        copyTextField(sceneNode, scene, "continuation_reason");
+        if (sceneNode.has("is_continuation")) {
+            scene.put("is_continuation", sceneNode.path("is_continuation").asBoolean(false));
+        }
+        scene.set("source_refs", asArray(sceneNode.get("source_refs")).deepCopy());
+
+        ArrayNode beats = objectMapper.createArrayNode();
+        Set<String> characterNames = new LinkedHashSet<>();
+        for (JsonNode character : asArray(sceneNode.get("characters"))) {
+            String name = character.isTextual() ? character.asText() : character.path("name").asText("");
+            name = ScriptCharacterNameNormalizer.displayName(name);
+            if (StringUtils.hasText(name)) {
+                characterNames.add(name);
+            }
+        }
+
+        int rawActionCount = 0;
+        int emptyActionCount = 0;
+        int validActionCount = 0;
+        int dialogueCount = 0;
+        for (JsonNode beat : asArray(sceneNode.get("beats"))) {
+            if (beat == null || !beat.isObject()) {
+                continue;
+            }
+            String type = normalizeBeatType(textOrDefault(beat, "type", "action"));
+            String text = beatText(beat);
+            if ("dialogue".equals(type)) {
+                dialogueCount++;
+                if (!hasMeaningfulText(text)) {
+                    continue;
+                }
+                String characterName = ScriptCharacterNameNormalizer.displayName(dialogueCharacter(beat));
+                if (!StringUtils.hasText(characterName)) {
+                    characterName = "未知";
+                }
+                characterNames.add(characterName);
+                ObjectNode sanitizedBeat = objectMapper.createObjectNode();
+                sanitizedBeat.put("type", "dialogue");
+                sanitizedBeat.put("character_name", characterName);
+                sanitizedBeat.put("text", text.trim());
+                beats.add(sanitizedBeat);
+                continue;
+            }
+
+            rawActionCount++;
+            if (!hasMeaningfulText(text)) {
+                emptyActionCount++;
+                continue;
+            }
+            validActionCount++;
+            ObjectNode sanitizedBeat = objectMapper.createObjectNode();
+            sanitizedBeat.put("type", type);
+            sanitizedBeat.put("text", text.trim());
+            beats.add(sanitizedBeat);
+        }
+
+        if (beats.isEmpty()) {
+            return new SanitizedScene(null, rawActionCount, emptyActionCount, validActionCount, dialogueCount);
+        }
+        ArrayNode characters = objectMapper.createArrayNode();
+        characterNames.forEach(characters::add);
+        scene.set("characters", characters);
+        scene.set("beats", beats);
+        return new SanitizedScene(scene, rawActionCount, emptyActionCount, validActionCount, dialogueCount);
+    }
+
+    private void copyTextField(JsonNode source, ObjectNode target, String field) {
+        String value = textOrNull(source, field);
+        if (StringUtils.hasText(value)) {
+            target.put(field, value.trim());
         }
     }
 
@@ -205,13 +345,16 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
             }
 
             ArrayNode beats = filterDialogueDuplicates(asArray(sceneNode.get("beats")), chapter.getId(), dedupState);
+            if (beats.isEmpty()) {
+                continue;
+            }
             ScriptScene scene = new ScriptScene();
             LocalDateTime now = LocalDateTime.now();
             scene.setNovelId(novel.getId());
             scene.setChapterId(chapter.getId());
             scene.setChunkId(chunk.getId());
             scene.setSceneId(sceneId);
-            scene.setTitle(textOrDefault(sceneNode, "title", "未命名场景"));
+            scene.setTitle(uniqueSceneTitle(chapter.getId(), textOrDefault(sceneNode, "title", "未命名场景"), dedupState));
             scene.setLocation(textOrNull(sceneNode, "location"));
             scene.setTimeOfDay(textOrNull(sceneNode, "time_of_day"));
             scene.setSummary(summary);
@@ -313,7 +456,7 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
         for (JsonNode character : characters) {
             String name = character.isTextual() ? character.asText() : character.path("name").asText("");
             if (StringUtils.hasText(name)) {
-                names.add(normalize(name));
+                names.add(ScriptCharacterNameNormalizer.key(name));
             }
         }
         return names;
@@ -324,10 +467,14 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
         ArrayNode newBeats = filterDialogueDuplicates(asArray(sceneNode.get("beats")), chapter.getId(), dedupState);
         newBeats.forEach(mergedBeats::add);
 
+        ArrayNode mergedCharacters = asArray(readJson(target.getCharactersJson()));
+        appendUniqueCharacters(mergedCharacters, asArray(sceneNode.get("characters")));
+
         ArrayNode mergedSources = asArray(readJson(target.getSourceRefsJson()));
         appendUniqueJson(mergedSources, resolveSourceRefs(sceneNode, chapter, chunk));
 
         target.setBeatsJson(writeJson(mergedBeats));
+        target.setCharactersJson(writeJson(mergedCharacters));
         target.setSourceRefsJson(writeJson(mergedSources));
         String incomingSummary = textOrNull(sceneNode, "summary");
         if (StringUtils.hasText(incomingSummary) && !normalize(incomingSummary).equals(normalize(target.getSummary()))) {
@@ -336,6 +483,15 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
         target.setUpdatedAt(LocalDateTime.now());
         sceneMapper.updateById(target);
         saveDialogues(target.getId(), newBeats);
+    }
+
+    private String uniqueSceneTitle(Long chapterId, String title, DedupState dedupState) {
+        String normalizedTitle = StringUtils.hasText(title) ? title.trim() : "未命名场景";
+        String key = normalize(normalizedTitle);
+        Map<String, Integer> titleCounts = dedupState.sceneTitleCountsByChapter.computeIfAbsent(chapterId, ignored -> new HashMap<>());
+        int count = titleCounts.getOrDefault(key, 0) + 1;
+        titleCounts.put(key, count);
+        return count == 1 ? normalizedTitle : normalizedTitle + "（" + count + "）";
     }
 
     private String mergeSummary(String existing, String incoming) {
@@ -354,6 +510,21 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
         additions.forEach(item -> {
             if (existing.add(item.toString())) {
                 target.add(item);
+            }
+        });
+    }
+
+    private void appendUniqueCharacters(ArrayNode target, ArrayNode additions) {
+        Set<String> existing = new HashSet<>();
+        target.forEach(item -> existing.add(ScriptCharacterNameNormalizer.key(item.isTextual()
+                ? item.asText()
+                : item.path("name").asText(""))));
+        additions.forEach(item -> {
+            String name = ScriptCharacterNameNormalizer.displayName(item.isTextual()
+                    ? item.asText()
+                    : item.path("name").asText(""));
+            if (StringUtils.hasText(name) && existing.add(ScriptCharacterNameNormalizer.key(name))) {
+                target.add(name);
             }
         });
     }
@@ -459,7 +630,9 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
         ArrayNode filtered = objectMapper.createArrayNode();
         for (JsonNode beat : beats) {
             if (!"dialogue".equals(beat.path("type").asText())) {
-                filtered.add(beat);
+                if (hasMeaningfulText(beatText(beat))) {
+                    filtered.add(beat);
+                }
                 continue;
             }
 
@@ -470,7 +643,7 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
             }
 
             String textKey = normalize(text);
-            String pairKey = normalize(characterName) + "|" + textKey;
+            String pairKey = ScriptCharacterNameNormalizer.key(characterName) + "|" + textKey;
             Set<String> textSet = dedupState.dialogueTextsByChapter.computeIfAbsent(chapterId, ignored -> new HashSet<>());
             Set<String> pairSet = dedupState.dialoguePairsByChapter.computeIfAbsent(chapterId, ignored -> new HashSet<>());
             if (textSet.contains(textKey) || pairSet.contains(pairKey)) {
@@ -478,7 +651,10 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
             }
             textSet.add(textKey);
             pairSet.add(pairKey);
-            filtered.add(beat);
+            ObjectNode sanitizedBeat = beat.deepCopy();
+            sanitizedBeat.put("character_name", ScriptCharacterNameNormalizer.displayName(characterName));
+            sanitizedBeat.put("text", text.trim());
+            filtered.add(sanitizedBeat);
         }
         return filtered;
     }
@@ -494,7 +670,7 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
             }
             ScriptDialogue dialogue = new ScriptDialogue();
             dialogue.setSceneDbId(sceneDbId);
-            dialogue.setCharacterName(dialogueCharacter(beat));
+            dialogue.setCharacterName(ScriptCharacterNameNormalizer.displayName(dialogueCharacter(beat)));
             dialogue.setText(text);
             dialogue.setCreatedAt(LocalDateTime.now());
             dialogueMapper.insert(dialogue);
@@ -504,29 +680,45 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
     private ArrayNode resolveSourceRefs(JsonNode sceneNode, NovelChapter chapter, NovelChunk chunk) {
         ArrayNode sourceRefs = asArray(sceneNode.get("source_refs"));
         if (!sourceRefs.isEmpty()) {
-            return sourceRefs;
+            ArrayNode normalized = objectMapper.createArrayNode();
+            for (JsonNode ref : sourceRefs) {
+                normalized.add(sourceRef(ref, chapter, chunk));
+            }
+            return normalized;
         }
+        ArrayNode fallback = objectMapper.createArrayNode();
+        fallback.add(sourceRef(null, chapter, chunk));
+        return fallback;
+    }
+
+    private ObjectNode sourceRef(JsonNode ref, NovelChapter chapter, NovelChunk chunk) {
+        int paragraphStart = chunk.getParagraphStart() == null ? 0 : chunk.getParagraphStart();
+        int paragraphEnd = chunk.getParagraphEnd() == null ? paragraphStart : chunk.getParagraphEnd();
         ObjectNode source = objectMapper.createObjectNode();
         source.put("chapter_index", chunk.getChapterIndex());
         source.put("chapter_title", chapter.getTitle());
         source.put("chunk_index", chunk.getChunkIndex());
-        source.put("paragraph_start", chunk.getParagraphStart());
-        source.put("paragraph_end", chunk.getParagraphEnd());
-        sourceRefs.add(source);
-        return sourceRefs;
+        source.put("paragraph_start", ref == null ? paragraphStart : ref.path("paragraph_start").asInt(paragraphStart));
+        source.put("paragraph_end", ref == null ? paragraphEnd : ref.path("paragraph_end").asInt(paragraphEnd));
+        return source;
     }
 
     private ScriptSceneView toSceneView(ScriptScene scene) {
-        List<String> characters = new ArrayList<>();
+        Set<String> characters = new LinkedHashSet<>();
         for (JsonNode character : asArray(readJson(scene.getCharactersJson()))) {
+            String name = "";
             if (character.isTextual()) {
-                characters.add(character.asText());
+                name = character.asText();
             } else if (character.has("name")) {
-                characters.add(character.path("name").asText());
+                name = character.path("name").asText();
+            }
+            name = ScriptCharacterNameNormalizer.displayName(name);
+            if (StringUtils.hasText(name)) {
+                characters.add(name);
             }
         }
         int beatsCount = asArray(readJson(scene.getBeatsJson())).size();
-        return ScriptSceneView.from(scene, characters, beatsCount);
+        return ScriptSceneView.from(scene, new ArrayList<>(characters), beatsCount);
     }
 
     private void updateTaskStatus(ScriptGenerationTask task, String status, String errorMessage) {
@@ -587,10 +779,37 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
     private String dialogueCharacter(JsonNode beat) {
         String character = beat.path("character_name").asText(null);
         if (StringUtils.hasText(character)) {
-            return character;
+            return ScriptCharacterNameNormalizer.displayName(character);
         }
         character = beat.path("character").asText(null);
-        return StringUtils.hasText(character) ? character : beat.path("character_id").asText("");
+        return ScriptCharacterNameNormalizer.displayName(StringUtils.hasText(character) ? character : beat.path("character_id").asText(""));
+    }
+
+    private String beatText(JsonNode beat) {
+        String text = textOrNull(beat, "text");
+        if (StringUtils.hasText(text)) {
+            return text;
+        }
+        text = textOrNull(beat, "description");
+        if (StringUtils.hasText(text)) {
+            return text;
+        }
+        text = textOrNull(beat, "content");
+        return StringUtils.hasText(text) ? text : "";
+    }
+
+    private boolean hasMeaningfulText(String value) {
+        if (!StringUtils.hasText(value)) {
+            return false;
+        }
+        return StringUtils.hasText(value.replaceAll("[\\s\\p{Punct}，。！？、；：“”‘’（）《》【】—…-]+", ""));
+    }
+
+    private String normalizeBeatType(String type) {
+        if ("dialogue".equals(type) || "transition".equals(type)) {
+            return type;
+        }
+        return "action";
     }
 
     private String textOrDefault(JsonNode node, String field, String defaultValue) {
@@ -688,9 +907,19 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
     private record OpenSceneRef(ScriptScene scene, Long chapterId, Integer chapterIndex, Integer chunkIndex, String stateSceneId) {
     }
 
+    private record QualityCheckedExtraction(ArrayNode scenes, JsonNode chapterState) {
+    }
+
+    private record QualityCheck(boolean accepted, ArrayNode scenes, String message) {
+    }
+
+    private record SanitizedScene(ObjectNode scene, int rawActionCount, int emptyActionCount, int validActionCount, int dialogueCount) {
+    }
+
     private static class DedupState {
         private final Set<String> sceneIds = new LinkedHashSet<>();
         private final Map<Long, List<ScriptScene>> scenesByChapter = new HashMap<>();
+        private final Map<Long, Map<String, Integer>> sceneTitleCountsByChapter = new HashMap<>();
         private final Map<Long, Set<String>> dialogueTextsByChapter = new HashMap<>();
         private final Map<Long, Set<String>> dialoguePairsByChapter = new HashMap<>();
     }

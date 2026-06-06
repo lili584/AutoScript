@@ -20,3 +20,4 @@ deepseek:
     base-url: ${DEEPSEEK_BASE_URL:https://api.deepseek.com}
     key: ${DEEPSEEK_API_KEY:}
     model: ${DEEPSEEK_MODEL:deepseek-v4-flash}
+    max-tokens: ${DEEPSEEK_MAX_TOKENS:8000}

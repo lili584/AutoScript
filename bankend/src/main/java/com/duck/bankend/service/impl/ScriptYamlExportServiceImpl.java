@@ -9,9 +9,11 @@ import com.duck.bankend.model.entity.NovelChapter;
 import com.duck.bankend.model.entity.ScriptScene;
 import com.duck.bankend.service.NovelService;
 import com.duck.bankend.service.ScriptYamlExportService;
+import com.duck.bankend.util.ScriptCharacterNameNormalizer;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
@@ -150,6 +152,7 @@ public class ScriptYamlExportServiceImpl implements ScriptYamlExportService {
     private void writeScenes(StringBuilder yaml, List<ScriptScene> scenes, Map<String, CharacterDraft> characters) {
         line(yaml, 0, "scenes:");
         int order = 1;
+        Map<String, Integer> titleCounts = new LinkedHashMap<>();
         for (ScriptScene scene : scenes) {
             SourceRef firstSource = firstSourceRef(scene.getSourceRefsJson());
             line(yaml, 1, "- id: " + scalar(scene.getSceneId()));
@@ -157,7 +160,7 @@ public class ScriptYamlExportServiceImpl implements ScriptYamlExportService {
             line(yaml, 2, "chapter:");
             line(yaml, 3, "index: " + firstSource.chapterIndex());
             line(yaml, 3, "title: " + scalar(firstSource.chapterTitle()));
-            line(yaml, 2, "title: " + scalar(scene.getTitle()));
+            line(yaml, 2, "title: " + scalar(uniqueSceneTitle(scene.getTitle(), titleCounts)));
             line(yaml, 2, "location: " + scalar(scene.getLocation()));
             line(yaml, 2, "time_of_day: " + scalar(scene.getTimeOfDay()));
             writeBlockText(yaml, 2, "summary", scene.getSummary());
@@ -186,7 +189,7 @@ public class ScriptYamlExportServiceImpl implements ScriptYamlExportService {
     }
 
     private void writeBeats(StringBuilder yaml, ScriptScene scene, Map<String, CharacterDraft> characters) {
-        ArrayNode beats = asArray(readJson(scene.getBeatsJson()));
+        ArrayNode beats = exportableBeats(scene);
         if (beats.isEmpty()) {
             line(yaml, 2, "beats: []");
             return;
@@ -205,6 +208,26 @@ public class ScriptYamlExportServiceImpl implements ScriptYamlExportService {
                 writeBlockText(yaml, 4, "text", textOrDefault(beat, "text", ""));
             }
         }
+    }
+
+    private ArrayNode exportableBeats(ScriptScene scene) {
+        ArrayNode result = objectMapper.createArrayNode();
+        for (JsonNode beat : asArray(readJson(scene.getBeatsJson()))) {
+            String type = normalizeBeatType(textOrDefault(beat, "type", "action"));
+            String text = beatText(beat);
+            if (!hasMeaningfulText(text)) {
+                continue;
+            }
+            ObjectNode exported = objectMapper.createObjectNode();
+            exported.put("type", type);
+            if ("dialogue".equals(type)) {
+                String characterName = dialogueCharacter(beat);
+                exported.put("character_name", StringUtils.hasText(characterName) ? characterName : "未知");
+            }
+            exported.put("text", text.trim());
+            result.add(exported);
+        }
+        return result;
     }
 
     private void writeSourceRefs(StringBuilder yaml, String sourceRefsJson) {
@@ -237,16 +260,16 @@ public class ScriptYamlExportServiceImpl implements ScriptYamlExportService {
     private List<String> collectSceneCharacterNames(ScriptScene scene) {
         Set<String> names = new LinkedHashSet<>();
         for (JsonNode character : asArray(readJson(scene.getCharactersJson()))) {
-            String name = character.isTextual() ? character.asText() : character.path("name").asText("");
+            String name = ScriptCharacterNameNormalizer.displayName(character.isTextual() ? character.asText() : character.path("name").asText(""));
             if (StringUtils.hasText(name)) {
-                names.add(name.trim());
+                names.add(name);
             }
         }
         for (JsonNode beat : asArray(readJson(scene.getBeatsJson()))) {
             if ("dialogue".equals(beat.path("type").asText())) {
                 String characterName = dialogueCharacter(beat);
                 if (StringUtils.hasText(characterName)) {
-                    names.add(characterName.trim());
+                    names.add(characterName);
                 }
             }
         }
@@ -254,6 +277,7 @@ public class ScriptYamlExportServiceImpl implements ScriptYamlExportService {
     }
 
     private void addCharacter(Map<String, CharacterDraft> characters, Map<String, Integer> idCounts, String name, String sceneId) {
+        name = ScriptCharacterNameNormalizer.displayName(name);
         String key = normalizeNameKey(name);
         if (!StringUtils.hasText(key) || characters.containsKey(key)) {
             return;
@@ -268,10 +292,10 @@ public class ScriptYamlExportServiceImpl implements ScriptYamlExportService {
     private String dialogueCharacter(JsonNode beat) {
         String character = beat.path("character_name").asText(null);
         if (StringUtils.hasText(character)) {
-            return character;
+            return ScriptCharacterNameNormalizer.displayName(character);
         }
         character = beat.path("character").asText(null);
-        return StringUtils.hasText(character) ? character : beat.path("character_id").asText("");
+        return ScriptCharacterNameNormalizer.displayName(StringUtils.hasText(character) ? character : beat.path("character_id").asText(""));
     }
 
     private SourceRef firstSourceRef(String sourceRefsJson) {
@@ -313,8 +337,35 @@ public class ScriptYamlExportServiceImpl implements ScriptYamlExportService {
         return value == null || value.isNull() ? defaultValue : value.asText(defaultValue);
     }
 
+    private String beatText(JsonNode beat) {
+        String text = textOrDefault(beat, "text", "");
+        if (StringUtils.hasText(text)) {
+            return text;
+        }
+        text = textOrDefault(beat, "description", "");
+        if (StringUtils.hasText(text)) {
+            return text;
+        }
+        return textOrDefault(beat, "content", "");
+    }
+
+    private boolean hasMeaningfulText(String value) {
+        if (!StringUtils.hasText(value)) {
+            return false;
+        }
+        return StringUtils.hasText(value.replaceAll("[\\s\\p{Punct}，。！？、；：“”‘’（）《》【】—…-]+", ""));
+    }
+
+    private String uniqueSceneTitle(String title, Map<String, Integer> titleCounts) {
+        String normalizedTitle = StringUtils.hasText(title) ? title.trim() : "未命名场景";
+        String key = normalizedTitle.replaceAll("[\\s\\p{Punct}，。！？、；：“”‘’（）《》【】]+", "").toLowerCase();
+        int count = titleCounts.getOrDefault(key, 0) + 1;
+        titleCounts.put(key, count);
+        return count == 1 ? normalizedTitle : normalizedTitle + "（" + count + "）";
+    }
+
     private String normalizeNameKey(String name) {
-        return StringUtils.hasText(name) ? name.trim().toLowerCase() : "";
+        return ScriptCharacterNameNormalizer.key(name);
     }
 
     private String normalizeBeatType(String type) {
