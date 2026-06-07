@@ -2,10 +2,12 @@ package com.duck.bankend.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.duck.bankend.mapper.NovelChapterMapper;
+import com.duck.bankend.mapper.ScriptCharacterProfileMapper;
 import com.duck.bankend.mapper.ScriptSceneMapper;
 import com.duck.bankend.model.dto.ScriptYamlPreview;
 import com.duck.bankend.model.entity.Novel;
 import com.duck.bankend.model.entity.NovelChapter;
+import com.duck.bankend.model.entity.ScriptCharacterProfile;
 import com.duck.bankend.model.entity.ScriptScene;
 import com.duck.bankend.service.NovelService;
 import com.duck.bankend.service.ScriptYamlExportService;
@@ -47,6 +49,7 @@ public class ScriptYamlExportServiceImpl implements ScriptYamlExportService {
     private final NovelService novelService;
     private final NovelChapterMapper chapterMapper;
     private final ScriptSceneMapper sceneMapper;
+    private final ScriptCharacterProfileMapper characterProfileMapper;
 
     @Override
     public ScriptYamlPreview previewYaml(Long novelId) {
@@ -94,7 +97,7 @@ public class ScriptYamlExportServiceImpl implements ScriptYamlExportService {
     }
 
     private String buildYaml(Novel novel, List<NovelChapter> chapters, List<ScriptScene> scenes, OffsetDateTime exportTime) {
-        Map<String, CharacterDraft> characters = collectCharacters(scenes);
+        Map<String, CharacterDraft> characters = collectCharacters(novel.getId(), scenes);
         StringBuilder yaml = new StringBuilder();
         line(yaml, 0, "schema_version: " + scalar(SCHEMA_VERSION));
         blank(yaml);
@@ -141,11 +144,25 @@ public class ScriptYamlExportServiceImpl implements ScriptYamlExportService {
         for (CharacterDraft character : characters.values()) {
             line(yaml, 1, "- id: " + scalar(character.id()));
             line(yaml, 2, "name: " + scalar(character.name()));
-            line(yaml, 2, "aliases: []");
-            line(yaml, 2, "role: " + scalar(""));
-            line(yaml, 2, "description: " + scalar(""));
+            writeCharacterAliases(yaml, character.aliasesJson());
+            line(yaml, 2, "role: " + scalar(character.role()));
+            line(yaml, 2, "description: " + scalar(character.description()));
             line(yaml, 2, "first_appearance:");
             line(yaml, 3, "scene_id: " + scalar(character.firstSceneId()));
+        }
+    }
+
+    private void writeCharacterAliases(StringBuilder yaml, String aliasesJson) {
+        ArrayNode aliases = asArray(readJson(aliasesJson));
+        if (aliases.isEmpty()) {
+            line(yaml, 2, "aliases: []");
+            return;
+        }
+        line(yaml, 2, "aliases:");
+        for (JsonNode alias : aliases) {
+            if (StringUtils.hasText(alias.asText())) {
+                line(yaml, 3, "- " + scalar(alias.asText()));
+            }
         }
     }
 
@@ -246,7 +263,7 @@ public class ScriptYamlExportServiceImpl implements ScriptYamlExportService {
         }
     }
 
-    private Map<String, CharacterDraft> collectCharacters(List<ScriptScene> scenes) {
+    private Map<String, CharacterDraft> collectCharacters(Long novelId, List<ScriptScene> scenes) {
         Map<String, CharacterDraft> characters = new LinkedHashMap<>();
         Map<String, Integer> idCounts = new LinkedHashMap<>();
         for (ScriptScene scene : scenes) {
@@ -254,7 +271,23 @@ public class ScriptYamlExportServiceImpl implements ScriptYamlExportService {
                 addCharacter(characters, idCounts, name, scene.getSceneId());
             }
         }
+        applyCharacterProfiles(novelId, characters);
         return characters;
+    }
+
+    private void applyCharacterProfiles(Long novelId, Map<String, CharacterDraft> characters) {
+        List<ScriptCharacterProfile> profiles = characterProfileMapper.selectList(new LambdaQueryWrapper<ScriptCharacterProfile>()
+                .eq(ScriptCharacterProfile::getNovelId, novelId));
+        for (ScriptCharacterProfile profile : profiles) {
+            String key = StringUtils.hasText(profile.getCharacterKey())
+                    ? profile.getCharacterKey()
+                    : normalizeNameKey(profile.getName());
+            CharacterDraft existing = characters.get(key);
+            if (existing == null) {
+                continue;
+            }
+            characters.put(key, existing.withProfile(profile));
+        }
     }
 
     private List<String> collectSceneCharacterNames(ScriptScene scene) {
@@ -286,7 +319,7 @@ public class ScriptYamlExportServiceImpl implements ScriptYamlExportService {
         int count = idCounts.getOrDefault(baseId, 0) + 1;
         idCounts.put(baseId, count);
         String id = count == 1 ? baseId : baseId + "-" + count;
-        characters.put(key, new CharacterDraft(id, name.trim(), sceneId));
+        characters.put(key, new CharacterDraft(id, name.trim(), sceneId, "[]", "", ""));
     }
 
     private String dialogueCharacter(JsonNode beat) {
@@ -424,7 +457,15 @@ public class ScriptYamlExportServiceImpl implements ScriptYamlExportService {
         yaml.append('\n');
     }
 
-    private record CharacterDraft(String id, String name, String firstSceneId) {
+    private record CharacterDraft(String id, String name, String firstSceneId,
+                                  String aliasesJson, String role, String description) {
+
+        private CharacterDraft withProfile(ScriptCharacterProfile profile) {
+            return new CharacterDraft(id, name, firstSceneId,
+                    StringUtils.hasText(profile.getAliasesJson()) ? profile.getAliasesJson() : "[]",
+                    StringUtils.hasText(profile.getRole()) ? profile.getRole() : "",
+                    StringUtils.hasText(profile.getDescription()) ? profile.getDescription() : "");
+        }
     }
 
     private record SourceRef(int chapterIndex, String chapterTitle, int chunkIndex, int paragraphStart, int paragraphEnd) {

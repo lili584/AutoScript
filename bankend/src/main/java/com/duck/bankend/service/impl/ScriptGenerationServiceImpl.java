@@ -1,11 +1,13 @@
 package com.duck.bankend.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.duck.bankend.client.DeepSeekCharacterProfileClient;
 import com.duck.bankend.client.DeepSeekSceneClient;
 import com.duck.bankend.client.DeepSeekSceneClient.SceneExtractionResult;
 import com.duck.bankend.constant.ScriptGenerationConst;
 import com.duck.bankend.constant.ScriptGenerationStatusConst;
 import com.duck.bankend.constant.DeepSeekPromptConst;
+import com.duck.bankend.mapper.ScriptCharacterProfileMapper;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
@@ -23,6 +25,7 @@ import com.duck.bankend.model.entity.Novel;
 import com.duck.bankend.model.entity.NovelChapter;
 import com.duck.bankend.model.entity.NovelChunk;
 import com.duck.bankend.model.entity.ScriptChapterState;
+import com.duck.bankend.model.entity.ScriptCharacterProfile;
 import com.duck.bankend.model.entity.ScriptDialogue;
 import com.duck.bankend.model.entity.ScriptGenerationTask;
 import com.duck.bankend.model.entity.ScriptScene;
@@ -63,9 +66,11 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
     private final ScriptGenerationRuntimeService runtimeService;
     private final NovelService novelService;
     private final DeepSeekSceneClient deepSeekSceneClient;
+    private final DeepSeekCharacterProfileClient deepSeekCharacterProfileClient;
     private final NovelChapterMapper chapterMapper;
     private final NovelChunkMapper chunkMapper;
     private final ScriptChapterStateMapper chapterStateMapper;
+    private final ScriptCharacterProfileMapper characterProfileMapper;
     private final ScriptGenerationTaskMapper taskMapper;
     private final ScriptSceneMapper sceneMapper;
     private final ScriptDialogueMapper dialogueMapper;
@@ -144,6 +149,7 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
         }
         sceneMapper.delete(new LambdaQueryWrapper<ScriptScene>().eq(ScriptScene::getNovelId, novelId));
         chapterStateMapper.delete(new LambdaQueryWrapper<ScriptChapterState>().eq(ScriptChapterState::getNovelId, novelId));
+        characterProfileMapper.delete(new LambdaQueryWrapper<ScriptCharacterProfile>().eq(ScriptCharacterProfile::getNovelId, novelId));
     }
 
     @Override
@@ -232,6 +238,7 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
                 previousOpenScene = resolveOpenScene(previousChapterState, saveResult, chapter, chunk);
                 incrementProgress(task, chunk);
             }
+            generateCharacterProfiles(novel);
             updateTaskStatus(task, ScriptGenerationStatusConst.SUCCEEDED, null);
         } catch (Exception exception) {
             updateTaskStatus(task, ScriptGenerationStatusConst.FAILED, exception.getMessage());
@@ -1043,6 +1050,106 @@ public class ScriptGenerationServiceImpl implements ScriptGenerationService {
                 .orderByAsc(ScriptScene::getChapterId)
                 .orderByAsc(ScriptScene::getChunkId)
                 .orderByAsc(ScriptScene::getId));
+    }
+
+    private void generateCharacterProfiles(Novel novel) {
+        if (!deepSeekCharacterProfileClient.isConfigured()) {
+            return;
+        }
+        List<ScriptScene> scenes = loadScenes(novel.getId());
+        Map<String, String> knownCharacters = collectKnownCharacters(scenes);
+        if (knownCharacters.isEmpty()) {
+            return;
+        }
+        try {
+            JsonNode profiles;
+            concurrencyLimiter.acquireDeepSeekRequest();
+            try {
+                profiles = deepSeekCharacterProfileClient.generateProfiles(buildCharacterProfileInput(scenes));
+            } finally {
+                concurrencyLimiter.releaseDeepSeekRequest();
+            }
+            saveCharacterProfiles(novel.getId(), profiles, knownCharacters);
+        } catch (Exception ignored) {
+            // 角色画像是附加信息，生成失败不阻塞主流程，并保留上一次成功结果。
+        }
+    }
+
+    private String buildCharacterProfileInput(List<ScriptScene> scenes) {
+        ArrayNode items = objectMapper.createArrayNode();
+        for (ScriptScene scene : scenes) {
+            ObjectNode item = objectMapper.createObjectNode();
+            item.put("scene_id", scene.getSceneId());
+            item.put("title", scene.getTitle());
+            item.put("location", scene.getLocation());
+            item.put("time_of_day", scene.getTimeOfDay());
+            item.put("summary", scene.getSummary());
+            item.set("characters", readJson(scene.getCharactersJson()));
+            item.set("dialogue_speakers", dialogueSpeakers(scene));
+            items.add(item);
+        }
+        return writeJson(items);
+    }
+
+    private Map<String, String> collectKnownCharacters(List<ScriptScene> scenes) {
+        Map<String, String> characters = new HashMap<>();
+        for (ScriptScene scene : scenes) {
+            collectCharacterNames(scene).forEach(name -> characters.putIfAbsent(ScriptCharacterNameNormalizer.key(name), name));
+        }
+        return characters;
+    }
+
+    private List<String> collectCharacterNames(ScriptScene scene) {
+        Set<String> names = new LinkedHashSet<>();
+        for (JsonNode character : asArray(readJson(scene.getCharactersJson()))) {
+            String name = ScriptCharacterNameNormalizer.displayName(character.isTextual() ? character.asText() : character.path("name").asText(""));
+            if (StringUtils.hasText(name)) {
+                names.add(name);
+            }
+        }
+        for (JsonNode beat : asArray(readJson(scene.getBeatsJson()))) {
+            if ("dialogue".equals(beat.path("type").asText())) {
+                String name = dialogueCharacter(beat);
+                if (StringUtils.hasText(name)) {
+                    names.add(name);
+                }
+            }
+        }
+        return new ArrayList<>(names);
+    }
+
+    private ArrayNode dialogueSpeakers(ScriptScene scene) {
+        ArrayNode speakers = objectMapper.createArrayNode();
+        Set<String> names = new LinkedHashSet<>();
+        for (JsonNode beat : asArray(readJson(scene.getBeatsJson()))) {
+            if ("dialogue".equals(beat.path("type").asText())) {
+                String name = dialogueCharacter(beat);
+                if (StringUtils.hasText(name) && names.add(name)) {
+                    speakers.add(name);
+                }
+            }
+        }
+        return speakers;
+    }
+
+    private void saveCharacterProfiles(Long novelId, JsonNode profiles, Map<String, String> knownCharacters) {
+        characterProfileMapper.delete(new LambdaQueryWrapper<ScriptCharacterProfile>()
+                .eq(ScriptCharacterProfile::getNovelId, novelId));
+        for (JsonNode profile : asArray(profiles)) {
+            String name = ScriptCharacterNameNormalizer.displayName(profile.path("name").asText(""));
+            String key = ScriptCharacterNameNormalizer.key(name);
+            if (!knownCharacters.containsKey(key)) {
+                continue;
+            }
+            ScriptCharacterProfile entity = new ScriptCharacterProfile();
+            entity.setNovelId(novelId);
+            entity.setCharacterKey(key);
+            entity.setName(knownCharacters.get(key));
+            entity.setAliasesJson(writeJson(asArray(profile.get("aliases"))));
+            entity.setRole(textOrDefault(profile, "role", ""));
+            entity.setDescription(textOrDefault(profile, "description", ""));
+            characterProfileMapper.insert(entity);
+        }
     }
 
     private List<NovelChunk> loadChunks(Long novelId) {
