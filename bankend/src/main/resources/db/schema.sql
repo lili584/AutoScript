@@ -103,3 +103,18 @@ create table if not exists script_chapter_states (
 
 create index if not exists idx_script_chapter_states_novel_order
     on script_chapter_states (novel_id, chapter_index, chunk_index);
+
+create table if not exists script_character_profiles (
+    id bigserial primary key,
+    novel_id bigint not null,
+    character_key varchar(160) not null,
+    name varchar(160) not null,
+    aliases_json text,
+    role varchar(200),
+    description text,
+    created_at timestamp not null default current_timestamp,
+    updated_at timestamp not null default current_timestamp
+);
+
+create unique index if not exists uk_script_character_profiles_novel_key
+    on script_character_profiles (novel_id, character_key);
