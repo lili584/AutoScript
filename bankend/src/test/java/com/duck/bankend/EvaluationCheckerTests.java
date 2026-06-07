@@ -14,6 +14,7 @@ import com.duck.bankend.service.evaluation.checker.ActionCoverageChecker;
 import com.duck.bankend.service.evaluation.checker.CharacterConsistencyChecker;
 import com.duck.bankend.service.evaluation.checker.DialoguePrecisionChecker;
 import com.duck.bankend.service.evaluation.checker.DialogueRecallChecker;
+import com.duck.bankend.service.evaluation.checker.FidelityChecker;
 import com.duck.bankend.service.evaluation.checker.StructureChecker;
 import org.junit.jupiter.api.Test;
 
@@ -73,7 +74,7 @@ class EvaluationCheckerTests {
                         character_name: "林屿安"
                         text: "密码正确"
                     source_refs:
-                      - chapter_index: 1
+                      - chapter_index: 2
                         chapter_title: "第一章 初遇"
                         chunk_index: 1
                         paragraph_start: 1
@@ -84,12 +85,16 @@ class EvaluationCheckerTests {
         EvaluationCheckResult precision = new DialoguePrecisionChecker().check(context);
         EvaluationCheckResult action = new ActionCoverageChecker().check(context);
         EvaluationCheckResult character = new CharacterConsistencyChecker().check(context);
+        EvaluationCheckResult fidelity = new FidelityChecker().check(context);
         EvaluationCheckResult structure = new StructureChecker().check(context);
 
         assertThat(recall.issues()).extracting("type").contains("对白遗漏");
         assertThat(recall.metric().getSummary()).contains("YAML 对白利用饱和度");
+        assertThat(recall.issues()).extracting("suggestion").anyMatch(suggestion -> String.valueOf(suggestion).contains("原文上下文"));
         assertThat(precision.issues()).extracting("type").contains("叙事误转对白");
         assertThat(action.issues()).extracting("type").contains("空动作描写", "场景完全无动作描写");
+        assertThat(action.issues()).extracting("suggestion").anyMatch(suggestion -> String.valueOf(suggestion).contains("可提取动作"));
+        assertThat(fidelity.issues()).extracting("suggestion").anyMatch(suggestion -> String.valueOf(suggestion).contains("替换为 action"));
         assertThat(character.issues()).extracting("type").contains("角色重复", "引用了未定义的角色");
         assertThat(character.metric().getNumerator()).isEqualTo(1);
         assertThat(character.metric().getDenominator()).isEqualTo(2);

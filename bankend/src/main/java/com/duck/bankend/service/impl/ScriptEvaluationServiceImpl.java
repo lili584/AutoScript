@@ -33,6 +33,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.stream.Collectors;
 
 @Service
 @RequiredArgsConstructor
@@ -75,9 +76,14 @@ public class ScriptEvaluationServiceImpl implements ScriptEvaluationService {
                 .map(EvaluationCheckResult::metric)
                 .sorted(Comparator.comparingInt(metric -> metricOrder(metric.getKey())))
                 .toList();
-        List<EvaluationIssue> issues = checkResults.stream()
+        List<EvaluationIssue> unsortedIssues = checkResults.stream()
                 .flatMap(result -> result.issues().stream())
-                .sorted(this::compareIssue)
+                .toList();
+        Map<String, Long> issueCountBySceneId = unsortedIssues.stream()
+                .filter(issue -> StringUtils.hasText(issue.getSceneId()))
+                .collect(Collectors.groupingBy(EvaluationIssue::getSceneId, Collectors.counting()));
+        List<EvaluationIssue> issues = unsortedIssues.stream()
+                .sorted((left, right) -> compareIssue(left, right, issueCountBySceneId))
                 .toList();
         double overall = metrics.stream().mapToDouble(EvaluationMetric::getScore).average().orElse(100);
         overall = Math.round(overall * 10.0) / 10.0;
@@ -129,7 +135,13 @@ public class ScriptEvaluationServiceImpl implements ScriptEvaluationService {
         return index < 0 ? METRIC_ORDER.size() : index;
     }
 
-    private int compareIssue(EvaluationIssue left, EvaluationIssue right) {
+    private int compareIssue(EvaluationIssue left, EvaluationIssue right, Map<String, Long> issueCountBySceneId) {
+        int sceneGroup = Long.compare(
+                issueCountBySceneId.getOrDefault(right.getSceneId(), 0L),
+                issueCountBySceneId.getOrDefault(left.getSceneId(), 0L));
+        if (sceneGroup != 0) {
+            return sceneGroup;
+        }
         int severity = Integer.compare(severityOrder(left.getSeverity()), severityOrder(right.getSeverity()));
         if (severity != 0) {
             return severity;

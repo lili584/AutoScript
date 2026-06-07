@@ -46,6 +46,7 @@ const evaluationFileInput = ref(null)
 const evaluationSelectedNovelId = ref('')
 const evaluationFiles = ref([])
 const evaluating = ref(false)
+const showEvaluationRules = ref(false)
 
 const form = reactive({
   title: '',
@@ -100,6 +101,38 @@ const evaluationMetricExtremes = computed(() => {
 const canEvaluateYaml = computed(() => {
   return evaluationSelectedNovelId.value && evaluationFiles.value.length > 0 && evaluationFiles.value.length <= 5 && !evaluating.value
 })
+const evaluationRuleItems = [
+  {
+    name: '对白召回率',
+    rule: '检查原文中引号对白是否被 YAML dialogue 覆盖。',
+    implementation: '从小说原文抽取直接对白，与 YAML dialogue 做 Levenshtein 相似度匹配，阈值为 0.75；未匹配的原文对白记为遗漏。',
+  },
+  {
+    name: '对白精确率',
+    rule: '检查 YAML dialogue 是否真实来自原文对白。',
+    implementation: '每条 YAML dialogue 反向匹配原文对白；相似度 >= 0.85 视为可信，0.60-0.85 视为小偏差，低于 0.60 视为疑似编造或叙事误转对白。',
+  },
+  {
+    name: '动作覆盖率',
+    rule: '检查 action/transition beat 是否有有效动作文本。',
+    implementation: '统计 action/transition 中归一化后长度不少于 3 的文本；空动作、无动作场景、全空动作场景会产生 issue。',
+  },
+  {
+    name: '角色一致性',
+    rule: '检查角色是否重复、引用是否能对应顶层 characters。',
+    implementation: '按角色名归一化检测重复人物；检查 scene.characters 和 dialogue.character_id 是否引用了已定义角色。',
+  },
+  {
+    name: '忠实度',
+    rule: '检查地点、时间、对白归属是否有原文依据。',
+    implementation: '优先在 scene.source_refs 对应段落中查找 location/time_of_day；检查 dialogue 角色是否在场景人物中，并识别叙事内容误转对白。',
+  },
+  {
+    name: '结构完整性',
+    rule: '检查 scene 结构是否完整且章节覆盖是否充分。',
+    implementation: '健康场景需要 scene_id 格式正确、beats 数不少于 3、包含 dialogue；最终分数按健康场景占比 70% + 章节覆盖 30% 计算。',
+  },
+]
 
 onMounted(() => {
   loadNovels()
@@ -751,6 +784,21 @@ function metricRankClass(metric) {
   }
 }
 
+function topSuggestedIssues(report) {
+  return (report?.issues || [])
+    .filter((issue) => issue?.suggestion)
+    .slice(0, 4)
+}
+
+function issueSeverityText(severity) {
+  const severityMap = {
+    error: '错误',
+    warning: '警告',
+    info: '提示',
+  }
+  return severityMap[severity] || '提示'
+}
+
 function formatFileSize(size) {
   if (!size) {
     return '0 KB'
@@ -1110,9 +1158,15 @@ function jumpToOutline(item) {
         <h2>YAML 多文件测评对比</h2>
         <p>选择一部小说，上传 1-5 份剧本 YAML，横向比较总分和各项指标。</p>
       </div>
-      <button class="icon-button" type="button" title="刷新小说列表" @click="loadNovels">
-        <RefreshCw :size="18" />
-      </button>
+      <div class="header-actions">
+        <button class="secondary-button compact" type="button" @click="showEvaluationRules = true">
+          <BarChart3 :size="17" />
+          评分规则
+        </button>
+        <button class="icon-button" type="button" title="刷新小说列表" @click="loadNovels">
+          <RefreshCw :size="18" />
+        </button>
+      </div>
     </header>
 
     <section class="evaluation-controls">
@@ -1181,7 +1235,7 @@ function jumpToOutline(item) {
       <div class="summary-card">
         <span>平均分</span>
         <strong>{{ evaluationSummary.average }}</strong>
-        <b :class="scoreClass(evaluationSummary.average)">{{ evaluationSummary.passedCount }}/{{ evaluationSummary.totalCount }} 通过</b>
+        <b :class="scoreClass(evaluationSummary.average)">已测 {{ evaluationSummary.totalCount }} 份</b>
       </div>
     </section>
 
@@ -1209,9 +1263,6 @@ function jumpToOutline(item) {
               <span v-if="overallRankLabel(item)" :class="overallRankLabel(item) === '最高' ? 'best' : 'worst'">
                 总分{{ overallRankLabel(item) }}
               </span>
-              <span :class="{ pass: isReportPassed(item.report), fail: !isReportPassed(item.report) }">
-                {{ isReportPassed(item.report) ? '通过' : '未通过' }}
-              </span>
               <span>{{ item.report.issues?.length || 0 }} issues</span>
             </div>
             <ul class="metric-list">
@@ -1228,11 +1279,44 @@ function jumpToOutline(item) {
                 <small>{{ metric.numerator }}/{{ metric.denominator }}</small>
               </li>
             </ul>
+            <div v-if="topSuggestedIssues(item.report).length > 0" class="suggestion-panel">
+              <h3>优先修改建议</h3>
+              <ol>
+                <li v-for="issue in topSuggestedIssues(item.report)" :key="`${issue.checker}-${issue.sceneId}-${issue.type}-${issue.paragraphStart}`">
+                  <div>
+                    <span :class="`issue-badge ${issue.severity}`">{{ issueSeverityText(issue.severity) }}</span>
+                    <strong>{{ issue.type }}</strong>
+                    <small v-if="issue.sceneId">{{ issue.sceneId }}</small>
+                  </div>
+                  <p>{{ issue.suggestion }}</p>
+                </li>
+              </ol>
+            </div>
           </template>
           <div v-else class="result-empty">{{ item.status === 'running' ? '正在测评...' : '等待开始' }}</div>
         </article>
       </div>
     </section>
   </main>
+  <div v-if="showEvaluationRules" class="modal-backdrop" @click.self="showEvaluationRules = false">
+    <section class="rules-modal" role="dialog" aria-modal="true" aria-labelledby="rules-title">
+      <header>
+        <div>
+          <p class="eyebrow">Score Rules</p>
+          <h2 id="rules-title">测评分数说明</h2>
+        </div>
+        <button class="icon-button" type="button" title="关闭" @click="showEvaluationRules = false">
+          <X :size="18" />
+        </button>
+      </header>
+      <div class="rules-list">
+        <article v-for="rule in evaluationRuleItems" :key="rule.name" class="rule-item">
+          <h3>{{ rule.name }}</h3>
+          <p>{{ rule.rule }}</p>
+          <small>{{ rule.implementation }}</small>
+        </article>
+      </div>
+    </section>
+  </div>
   </div>
 </template>

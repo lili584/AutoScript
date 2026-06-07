@@ -34,7 +34,7 @@ public class DialogueRecallChecker extends BaseEvaluationChecker {
                 issues.add(issue("Dialogue Recall", "error", "对白遗漏",
                         "原文对白未在 YAML dialogue 中找到足够相似的匹配",
                         null, novelDialogue.chapterIndex(), novelDialogue.paragraphNumber(), novelDialogue.paragraphNumber(),
-                        null, novelDialogue.text(), "补充该对白，或检查该场景是否被遗漏"));
+                        null, novelDialogue.text(), recallSuggestion(novelDialogue)));
             }
         }
         int total = context.novel().dialogues().size();
@@ -60,6 +60,11 @@ public class DialogueRecallChecker extends BaseEvaluationChecker {
             }
         }
         return new Match(best, bestScore, bestIndex);
+    }
+
+    private String recallSuggestion(NovelDialogueData dialogue) {
+        return "补充该对白。原文上下文: \"%s...\"。该对白位于第 %d 段，建议匹配到同章节最近的 YAML scene"
+                .formatted(dialogue.speakerContext(), dialogue.paragraphNumber());
     }
 
     private record Match(YamlDialogueData dialogue, double score, int index) {

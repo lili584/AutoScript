@@ -73,7 +73,7 @@ public class FidelityChecker extends BaseEvaluationChecker {
                     issues.add(issue("Fidelity", "error", "叙事内容被转为对白",
                             "dialogue.text 在原文中存在，但不是引号包裹的直接对白",
                             scene.id(), scene.chapterIndex(), firstParagraph(scene), lastParagraph(scene),
-                            beat.text(), null, "改为 action 或删除该 dialogue"));
+                            beat.text(), null, narrativeDialogueSuggestion(context.novel().fullText(), beat.text())));
                 }
             }
         }
@@ -93,6 +93,36 @@ public class FidelityChecker extends BaseEvaluationChecker {
             }
         }
         return names;
+    }
+
+    private String narrativeDialogueSuggestion(String fullText, String dialogueText) {
+        String sentence = sentenceContaining(fullText, dialogueText);
+        if (!StringUtils.hasText(sentence)) {
+            return "改为 action 或删除该 dialogue";
+        }
+        return "该文本在原文中为间接叙述，建议删除此 dialogue，替换为 action: \"%s\"".formatted(sentence);
+    }
+
+    private String sentenceContaining(String fullText, String text) {
+        int index = fullText.indexOf(text);
+        if (index < 0) {
+            return "";
+        }
+        int start = Math.max(Math.max(fullText.lastIndexOf('。', index), fullText.lastIndexOf('！', index)), fullText.lastIndexOf('？', index)) + 1;
+        int end = nextSentenceEnd(fullText, index);
+        String sentence = fullText.substring(start, end).trim();
+        return sentence.length() > 80 ? sentence.substring(0, 80) : sentence;
+    }
+
+    private int nextSentenceEnd(String fullText, int index) {
+        int end = fullText.length();
+        for (char mark : new char[]{'。', '！', '？'}) {
+            int found = fullText.indexOf(mark, index);
+            if (found >= 0) {
+                end = Math.min(end, found + 1);
+            }
+        }
+        return end;
     }
 
     private String sourceText(EvaluationContext context, YamlSceneData scene, String fallbackChapterText) {
