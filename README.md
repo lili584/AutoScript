@@ -2,8 +2,6 @@
 
 > 演示视频：https://www.bilibili.com/video/BV1KnEt6MEye/?vd_source=c80ba0f6fecbebaada6d9e607c42e018
 > 
-> 线上地址：https://duck1437.shop/auto-script/
-> 
 > 作品方向：AI 小说转剧本工具  
 > 
 > Schema 文档：[SCRIPT_YAML_SCHEMA.md](SCRIPT_YAML_SCHEMA.md)
