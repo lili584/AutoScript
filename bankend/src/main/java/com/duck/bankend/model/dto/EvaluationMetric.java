@@ -15,4 +15,5 @@ public class EvaluationMetric {
     private Integer numerator;
     private Integer denominator;
     private String summary;
+    private Double threshold;
 }

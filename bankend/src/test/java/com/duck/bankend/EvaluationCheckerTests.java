@@ -87,10 +87,14 @@ class EvaluationCheckerTests {
         EvaluationCheckResult structure = new StructureChecker().check(context);
 
         assertThat(recall.issues()).extracting("type").contains("对白遗漏");
+        assertThat(recall.metric().getSummary()).contains("YAML 对白利用饱和度");
         assertThat(precision.issues()).extracting("type").contains("叙事误转对白");
         assertThat(action.issues()).extracting("type").contains("空动作描写", "场景完全无动作描写");
         assertThat(character.issues()).extracting("type").contains("角色重复", "引用了未定义的角色");
+        assertThat(character.metric().getNumerator()).isEqualTo(1);
+        assertThat(character.metric().getDenominator()).isEqualTo(2);
         assertThat(structure.issues()).extracting("type").contains("scene_id 格式异常", "场景 beat 数过少", "有章节完全未被覆盖");
+        assertThat(structure.metric().getSummary()).contains("健康场景 0/1", "章节覆盖 1/3");
     }
 
     private EvaluationContext context(String novelText, String yamlText) {

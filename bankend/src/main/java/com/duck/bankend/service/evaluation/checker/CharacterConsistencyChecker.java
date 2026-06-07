@@ -34,10 +34,14 @@ public class CharacterConsistencyChecker extends BaseEvaluationChecker {
             }
         }
 
+        int duplicateGroupCount = 0;
+        int duplicateCharacters = 0;
         for (Map.Entry<String, List<YamlCharacterData>> entry : grouped.entrySet()) {
             if (entry.getValue().size() <= 1) {
                 continue;
             }
+            duplicateGroupCount++;
+            duplicateCharacters += entry.getValue().size() - 1;
             String names = entry.getValue().stream().map(YamlCharacterData::name).filter(StringUtils::hasText).distinct().toList().toString();
             issues.add(issue("Character Consistency", "warning", "角色重复",
                     "多个角色可归并为同一标准名",
@@ -63,10 +67,12 @@ public class CharacterConsistencyChecker extends BaseEvaluationChecker {
                             beat.characterId(), beat.text(), "修正 character_id 或补充角色定义")));
         }
 
-        int denominator = Math.max(1, context.yaml().characters().size() + context.yaml().scenes().size());
-        int numerator = Math.max(0, denominator - issues.size());
+        int totalCharacters = context.yaml().characters().size();
+        int consistentCharacters = Math.max(0, totalCharacters - duplicateCharacters);
         return new EvaluationCheckResult(
-                metric("character_consistency", "角色一致性", numerator, denominator, "角色一致性问题 %d 个".formatted(issues.size())),
+                metric("character_consistency", "角色一致性", consistentCharacters, totalCharacters,
+                        "角色一致 %d/%d，重复 %d 组，未定义引用 %d 个".formatted(
+                                consistentCharacters, totalCharacters, duplicateGroupCount, issues.size() - duplicateGroupCount)),
                 issues
         );
     }

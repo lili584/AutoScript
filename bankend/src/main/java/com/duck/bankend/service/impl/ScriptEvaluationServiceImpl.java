@@ -15,6 +15,7 @@ import com.duck.bankend.model.evaluation.YamlDialogueData;
 import com.duck.bankend.service.NovelService;
 import com.duck.bankend.service.ScriptEvaluationService;
 import com.duck.bankend.service.evaluation.NovelEvaluationParser;
+import com.duck.bankend.service.evaluation.EvaluationMarkdownReporter;
 import com.duck.bankend.service.evaluation.ScriptYamlEvaluationParser;
 import com.duck.bankend.service.evaluation.checker.EvaluationChecker;
 import lombok.RequiredArgsConstructor;
@@ -49,6 +50,7 @@ public class ScriptEvaluationServiceImpl implements ScriptEvaluationService {
     private final NovelService novelService;
     private final NovelEvaluationParser novelEvaluationParser;
     private final ScriptYamlEvaluationParser scriptYamlEvaluationParser;
+    private final EvaluationMarkdownReporter evaluationMarkdownReporter;
     private final List<EvaluationChecker> checkers;
 
     @Override
@@ -79,14 +81,16 @@ public class ScriptEvaluationServiceImpl implements ScriptEvaluationService {
                 .toList();
         double overall = metrics.stream().mapToDouble(EvaluationMetric::getScore).average().orElse(100);
         overall = Math.round(overall * 10.0) / 10.0;
+        boolean passed = overall >= 80 && metrics.stream().allMatch(metric -> metric.getScore() >= metric.getThreshold());
 
         EvaluationReport report = new EvaluationReport();
         report.setNovelId(novelId);
         report.setYamlFileName(file.getOriginalFilename());
         report.setOverallScore(overall);
+        report.setPassed(passed);
         report.setScorecard(new EvaluationScorecard(metrics));
         report.setIssues(issues);
-        report.setIssuesMarkdown(buildIssuesMarkdown(overall, metrics, issues));
+        report.setIssuesMarkdown(evaluationMarkdownReporter.build(overall, passed, metrics, issues));
         return report;
     }
 
@@ -149,53 +153,4 @@ public class ScriptEvaluationServiceImpl implements ScriptEvaluationService {
         return value == null ? Integer.MAX_VALUE : value;
     }
 
-    private String buildIssuesMarkdown(double overall, List<EvaluationMetric> metrics, List<EvaluationIssue> issues) {
-        StringBuilder markdown = new StringBuilder();
-        markdown.append("# 剧本 YAML 测评报告\n\n");
-        markdown.append("## 总分\n\n");
-        markdown.append("- overall_score: ").append(overall).append("\n\n");
-        markdown.append("## Scorecard\n\n");
-        markdown.append("| 指标 | 分数 | 通过/总数 | 摘要 |\n");
-        markdown.append("| --- | ---: | ---: | --- |\n");
-        for (EvaluationMetric metric : metrics) {
-            markdown.append("| ")
-                    .append(metric.getName())
-                    .append(" | ")
-                    .append(metric.getScore())
-                    .append(" | ")
-                    .append(metric.getNumerator())
-                    .append("/")
-                    .append(metric.getDenominator())
-                    .append(" | ")
-                    .append(metric.getSummary())
-                    .append(" |\n");
-        }
-        markdown.append("\n## Issues\n\n");
-        if (issues.isEmpty()) {
-            markdown.append("未发现明显问题。\n");
-            return markdown.toString();
-        }
-        for (EvaluationIssue issue : issues) {
-            markdown.append("- [")
-                    .append(issue.getSeverity())
-                    .append("] ")
-                    .append(issue.getType())
-                    .append(": ")
-                    .append(issue.getMessage());
-            if (StringUtils.hasText(issue.getSceneId())) {
-                markdown.append(" scene=").append(issue.getSceneId());
-            }
-            if (issue.getChapterIndex() != null) {
-                markdown.append(" chapter=").append(issue.getChapterIndex());
-            }
-            if (StringUtils.hasText(issue.getYamlText())) {
-                markdown.append(" yaml=\"").append(issue.getYamlText()).append("\"");
-            }
-            if (StringUtils.hasText(issue.getSuggestion())) {
-                markdown.append(" suggestion=").append(issue.getSuggestion());
-            }
-            markdown.append("\n");
-        }
-        return markdown.toString();
-    }
 }

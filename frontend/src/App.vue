@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import {
+  BarChart3,
   Bot,
   BookOpen,
   ChevronDown,
@@ -16,10 +17,13 @@ import {
   Save,
   Scissors,
   Sparkles,
+  Trophy,
   Trash2,
   Upload,
+  X,
 } from 'lucide-vue-next'
 
+const activeWorkspace = ref('novels')
 const novels = ref([])
 const selectedNovel = ref(null)
 const loading = ref(false)
@@ -38,6 +42,10 @@ const scriptScenes = ref([])
 const yamlPreview = ref('')
 const yamlFileName = ref('')
 const pollingTimer = ref(null)
+const evaluationFileInput = ref(null)
+const evaluationSelectedNovelId = ref('')
+const evaluationFiles = ref([])
+const evaluating = ref(false)
 
 const form = reactive({
   title: '',
@@ -52,6 +60,46 @@ const selectedId = computed(() => selectedNovel.value?.id)
 const hasNovels = computed(() => novels.value.length > 0)
 const outlineItems = computed(() => parseMarkdownOutline(contentDraft.value))
 const chunkCount = computed(() => chapters.value.reduce((total, chapter) => total + chapter.chunkCount, 0))
+const evaluationResults = computed(() => evaluationFiles.value.filter((item) => item.status === 'succeeded' && item.report))
+const evaluationSummary = computed(() => {
+  const results = evaluationResults.value
+  if (results.length === 0) {
+    return null
+  }
+
+  const sorted = [...results].sort((left, right) => scoreOf(right.report) - scoreOf(left.report))
+  const total = results.reduce((sum, item) => sum + scoreOf(item.report), 0)
+  return {
+    best: sorted[0],
+    lowest: sorted[sorted.length - 1],
+    average: Math.round((total / results.length) * 10) / 10,
+    passedCount: results.filter((item) => isReportPassed(item.report)).length,
+    totalCount: results.length,
+  }
+})
+const evaluationMetricExtremes = computed(() => {
+  const extremes = {}
+  for (const item of evaluationResults.value) {
+    const metrics = item.report?.scorecard?.metrics || []
+    for (const metric of metrics) {
+      if (!metric?.key) {
+        continue
+      }
+      const score = Number(metric.score || 0)
+      const current = extremes[metric.key] || {
+        highest: score,
+        lowest: score,
+      }
+      current.highest = Math.max(current.highest, score)
+      current.lowest = Math.min(current.lowest, score)
+      extremes[metric.key] = current
+    }
+  }
+  return extremes
+})
+const canEvaluateYaml = computed(() => {
+  return evaluationSelectedNovelId.value && evaluationFiles.value.length > 0 && evaluationFiles.value.length <= 5 && !evaluating.value
+})
 
 onMounted(() => {
   loadNovels()
@@ -92,6 +140,23 @@ function validateMarkdownFile(file) {
   return true
 }
 
+function validateYamlFiles(files) {
+  if (files.length === 0) {
+    errorMessage.value = '请选择至少 1 个 YAML 文件'
+    return false
+  }
+  if (files.length > 5) {
+    errorMessage.value = '一次最多测评 5 个 YAML 文件'
+    return false
+  }
+  const invalidFile = files.find((file) => !/\.(ya?ml)$/i.test(file.name))
+  if (invalidFile) {
+    errorMessage.value = `只支持上传 .yaml 或 .yml 文件：${invalidFile.name}`
+    return false
+  }
+  return true
+}
+
 function buildMarkdownFormData(file, extra = {}) {
   const data = new FormData()
   data.append('file', file)
@@ -101,6 +166,63 @@ function buildMarkdownFormData(file, extra = {}) {
     }
   })
   return data
+}
+
+function selectEvaluationFiles(event) {
+  clearMessage()
+  const files = Array.from(event.target.files || [])
+  event.target.value = ''
+  if (!validateYamlFiles(files)) {
+    return
+  }
+  evaluationFiles.value = files.map((file, index) => ({
+    id: `${Date.now()}-${index}`,
+    file,
+    name: file.name,
+    size: file.size,
+    status: 'waiting',
+    report: null,
+    error: '',
+  }))
+}
+
+function clearEvaluationFiles() {
+  evaluationFiles.value = []
+}
+
+async function evaluateYamlFiles() {
+  clearMessage()
+  if (!evaluationSelectedNovelId.value) {
+    errorMessage.value = '请先选择小说'
+    return
+  }
+  if (!validateYamlFiles(evaluationFiles.value.map((item) => item.file))) {
+    return
+  }
+
+  evaluating.value = true
+  try {
+    for (const item of evaluationFiles.value) {
+      item.status = 'running'
+      item.error = ''
+      item.report = null
+      try {
+        const data = new FormData()
+        data.append('file', item.file)
+        item.report = await request(`/api/novels/${evaluationSelectedNovelId.value}/evaluations/yaml`, {
+          method: 'POST',
+          body: data,
+        })
+        item.status = 'succeeded'
+      } catch (error) {
+        item.status = 'failed'
+        item.error = error.message
+      }
+    }
+    successMessage.value = 'YAML 测评完成'
+  } finally {
+    evaluating.value = false
+  }
 }
 
 async function loadNovels() {
@@ -553,6 +675,92 @@ function taskStatusText(status) {
   return statusMap[status] || '未开始'
 }
 
+function evaluationStatusText(status) {
+  const statusMap = {
+    waiting: '等待测评',
+    running: '测评中',
+    succeeded: '已完成',
+    failed: '失败',
+  }
+  return statusMap[status] || '等待测评'
+}
+
+function scoreOf(report) {
+  return Number(report?.overallScore || 0)
+}
+
+function isReportPassed(report) {
+  if (typeof report?.passed === 'boolean') {
+    return report.passed
+  }
+  const metrics = report?.scorecard?.metrics || []
+  return scoreOf(report) >= 80 && metrics.every((metric) => Number(metric.score || 0) >= metricThreshold(metric))
+}
+
+function metricThreshold(metric) {
+  return Number(metric?.threshold ?? 80)
+}
+
+function scoreClass(score) {
+  if (Number(score) >= 85) {
+    return 'score-high'
+  }
+  if (Number(score) >= 70) {
+    return 'score-medium'
+  }
+  return 'score-low'
+}
+
+function overallRankLabel(item) {
+  if (!evaluationSummary.value || evaluationResults.value.length < 2 || !item.report) {
+    return ''
+  }
+  const score = scoreOf(item.report)
+  if (score === scoreOf(evaluationSummary.value.best.report)) {
+    return '最高'
+  }
+  if (score === scoreOf(evaluationSummary.value.lowest.report)) {
+    return '最低'
+  }
+  return ''
+}
+
+function metricRankLabel(metric) {
+  if (evaluationResults.value.length < 2 || !metric?.key) {
+    return ''
+  }
+  const extreme = evaluationMetricExtremes.value[metric.key]
+  if (!extreme || extreme.highest === extreme.lowest) {
+    return ''
+  }
+  const score = Number(metric.score || 0)
+  if (score === extreme.highest) {
+    return '最高'
+  }
+  if (score === extreme.lowest) {
+    return '最低'
+  }
+  return ''
+}
+
+function metricRankClass(metric) {
+  const label = metricRankLabel(metric)
+  return {
+    'metric-best': label === '最高',
+    'metric-worst': label === '最低',
+  }
+}
+
+function formatFileSize(size) {
+  if (!size) {
+    return '0 KB'
+  }
+  if (size < 1024 * 1024) {
+    return `${Math.ceil(size / 1024)} KB`
+  }
+  return `${(size / 1024 / 1024).toFixed(1)} MB`
+}
+
 function clearMessage() {
   errorMessage.value = ''
   successMessage.value = ''
@@ -609,7 +817,27 @@ function jumpToOutline(item) {
 </script>
 
 <template>
-  <main class="workspace">
+  <div class="app-shell">
+    <nav class="workspace-switcher" aria-label="工作区切换">
+      <button
+        type="button"
+        :class="{ active: activeWorkspace === 'novels' }"
+        @click="activeWorkspace = 'novels'"
+      >
+        <BookOpen :size="18" />
+        小说管理
+      </button>
+      <button
+        type="button"
+        :class="{ active: activeWorkspace === 'evaluation' }"
+        @click="activeWorkspace = 'evaluation'"
+      >
+        <BarChart3 :size="18" />
+        测评对比
+      </button>
+    </nav>
+
+  <main v-if="activeWorkspace === 'novels'" class="workspace">
     <aside class="sidebar">
       <header class="panel-header">
         <div>
@@ -872,4 +1100,139 @@ function jumpToOutline(item) {
       </template>
     </section>
   </main>
+  <main v-else class="evaluation-workspace">
+    <div v-if="errorMessage" class="message error">{{ errorMessage }}</div>
+    <div v-if="successMessage" class="message success">{{ successMessage }}</div>
+
+    <header class="detail-header evaluation-header">
+      <div>
+        <p class="eyebrow">Evaluation</p>
+        <h2>YAML 多文件测评对比</h2>
+        <p>选择一部小说，上传 1-5 份剧本 YAML，横向比较总分和各项指标。</p>
+      </div>
+      <button class="icon-button" type="button" title="刷新小说列表" @click="loadNovels">
+        <RefreshCw :size="18" />
+      </button>
+    </header>
+
+    <section class="evaluation-controls">
+      <label>
+        <span>选择小说</span>
+        <select v-model="evaluationSelectedNovelId">
+          <option value="">请选择要测评的小说</option>
+          <option v-for="novel in novels" :key="novel.id" :value="novel.id">
+            {{ novel.title }}
+          </option>
+        </select>
+      </label>
+
+      <div class="upload-box">
+        <input
+          ref="evaluationFileInput"
+          class="file-input"
+          type="file"
+          accept=".yaml,.yml,application/x-yaml,text/yaml"
+          multiple
+          @change="selectEvaluationFiles"
+        />
+        <button class="secondary-button" type="button" :disabled="evaluating" @click="evaluationFileInput?.click()">
+          <Upload :size="18" />
+          选择 YAML
+        </button>
+        <button class="secondary-button" type="button" :disabled="evaluating || evaluationFiles.length === 0" @click="clearEvaluationFiles">
+          <X :size="18" />
+          清空文件
+        </button>
+        <button class="primary-button" type="button" :disabled="!canEvaluateYaml" @click="evaluateYamlFiles">
+          <BarChart3 :size="18" />
+          开始测评
+        </button>
+      </div>
+    </section>
+
+    <section class="evaluation-files">
+      <div class="section-title">
+        <h2><FileText :size="18" /> 待测文件</h2>
+        <span>{{ evaluationFiles.length }}/5</span>
+      </div>
+      <div v-if="evaluationFiles.length === 0" class="outline-empty">选择 1-5 个 YAML 文件开始测评</div>
+      <ul v-else class="evaluation-file-list">
+        <li v-for="item in evaluationFiles" :key="item.id">
+          <div>
+            <strong>{{ item.name }}</strong>
+            <span>{{ formatFileSize(item.size) }}</span>
+          </div>
+          <small :class="`eval-status ${item.status}`">{{ evaluationStatusText(item.status) }}</small>
+        </li>
+      </ul>
+    </section>
+
+    <section v-if="evaluationSummary" class="evaluation-summary">
+      <div class="summary-card">
+        <span>最佳文件</span>
+        <strong>{{ evaluationSummary.best.name }}</strong>
+        <b :class="scoreClass(scoreOf(evaluationSummary.best.report))">{{ scoreOf(evaluationSummary.best.report) }}</b>
+      </div>
+      <div class="summary-card">
+        <span>最低文件</span>
+        <strong>{{ evaluationSummary.lowest.name }}</strong>
+        <b :class="scoreClass(scoreOf(evaluationSummary.lowest.report))">{{ scoreOf(evaluationSummary.lowest.report) }}</b>
+      </div>
+      <div class="summary-card">
+        <span>平均分</span>
+        <strong>{{ evaluationSummary.average }}</strong>
+        <b :class="scoreClass(evaluationSummary.average)">{{ evaluationSummary.passedCount }}/{{ evaluationSummary.totalCount }} 通过</b>
+      </div>
+    </section>
+
+    <section class="evaluation-results">
+      <div class="section-title">
+        <h2><Trophy :size="18" /> 测评结果</h2>
+        <span>{{ evaluationResults.length }}</span>
+      </div>
+      <div v-if="evaluationFiles.length === 0" class="outline-empty">暂无测评结果</div>
+      <div v-else class="result-grid">
+        <article v-for="item in evaluationFiles" :key="item.id" class="result-card" :class="{ failed: item.status === 'failed' }">
+          <header>
+            <div>
+              <strong>{{ item.name }}</strong>
+              <span>{{ evaluationStatusText(item.status) }}</span>
+            </div>
+            <b v-if="item.report" class="score-pill" :class="scoreClass(scoreOf(item.report))">
+              {{ scoreOf(item.report) }}
+            </b>
+          </header>
+
+          <p v-if="item.error" class="result-error">{{ item.error }}</p>
+          <template v-else-if="item.report">
+            <div class="result-meta">
+              <span v-if="overallRankLabel(item)" :class="overallRankLabel(item) === '最高' ? 'best' : 'worst'">
+                总分{{ overallRankLabel(item) }}
+              </span>
+              <span :class="{ pass: isReportPassed(item.report), fail: !isReportPassed(item.report) }">
+                {{ isReportPassed(item.report) ? '通过' : '未通过' }}
+              </span>
+              <span>{{ item.report.issues?.length || 0 }} issues</span>
+            </div>
+            <ul class="metric-list">
+              <li
+                v-for="metric in item.report.scorecard?.metrics || []"
+                :key="metric.key"
+                :class="[{ risky: Number(metric.score || 0) < metricThreshold(metric) }, metricRankClass(metric)]"
+              >
+                <span>{{ metric.name }}</span>
+                <strong>
+                  {{ metric.score }}
+                  <em v-if="metricRankLabel(metric)">{{ metricRankLabel(metric) }}</em>
+                </strong>
+                <small>{{ metric.numerator }}/{{ metric.denominator }}</small>
+              </li>
+            </ul>
+          </template>
+          <div v-else class="result-empty">{{ item.status === 'running' ? '正在测评...' : '等待开始' }}</div>
+        </article>
+      </div>
+    </section>
+  </main>
+  </div>
 </template>

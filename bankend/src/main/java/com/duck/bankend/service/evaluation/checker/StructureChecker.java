@@ -23,26 +23,33 @@ public class StructureChecker extends BaseEvaluationChecker {
         Map<String, List<YamlSceneData>> scenesByTitle = new LinkedHashMap<>();
         Map<Integer, List<YamlSceneData>> scenesByChapter = new LinkedHashMap<>();
         Set<Integer> yamlChapterIndexes = new LinkedHashSet<>();
+        int healthyScenes = 0;
 
         for (YamlSceneData scene : context.yaml().scenes()) {
             scenesByTitle.computeIfAbsent(EvaluationTextUtil.normalize(scene.title()), ignored -> new ArrayList<>()).add(scene);
             scenesByChapter.computeIfAbsent(scene.chapterIndex(), ignored -> new ArrayList<>()).add(scene);
             yamlChapterIndexes.add(scene.chapterIndex());
 
-            if (!scene.id().matches("chapter-\\d+-chunk-\\d+-.+")) {
+            boolean idOk = scene.id() != null && scene.id().matches("chapter-\\d+-chunk-\\d+-.+");
+            boolean beatsOk = scene.beats().size() >= 3;
+            boolean hasDialogue = scene.beats().stream().anyMatch(beat -> "dialogue".equals(beat.type()));
+            if (idOk && beatsOk && hasDialogue) {
+                healthyScenes++;
+            }
+
+            if (!idOk) {
                 issues.add(issue("Structure", "warning", "scene_id 格式异常",
                         "scene_id 不符合 chapter-{n}-chunk-{n}-... 格式",
                         scene.id(), scene.chapterIndex(), firstParagraph(scene), lastParagraph(scene),
                         scene.id(), null, "按生成规范修正 scene_id"));
             }
-            if (scene.beats().size() < 3) {
+            if (!beatsOk) {
                 issues.add(issue("Structure", "warning", "场景 beat 数过少",
                         "场景 beats 少于 3 条，可能缺少动作或对白",
                         scene.id(), scene.chapterIndex(), firstParagraph(scene), lastParagraph(scene),
                         String.valueOf(scene.beats().size()), null, "补充必要 beat"));
             }
-            long dialogueCount = scene.beats().stream().filter(beat -> "dialogue".equals(beat.type())).count();
-            if (dialogueCount == 0) {
+            if (!hasDialogue) {
                 issues.add(issue("Structure", "info", "纯动作场景无对白",
                         "场景没有 dialogue beat，如不是纯动作场景请补充对白",
                         scene.id(), scene.chapterIndex(), firstParagraph(scene), lastParagraph(scene),
@@ -76,10 +83,18 @@ public class StructureChecker extends BaseEvaluationChecker {
             }
         }
 
-        int denominator = Math.max(1, context.yaml().scenes().size() * 4 + context.novelChapterIndexes().size());
-        int numerator = Math.max(0, denominator - issues.size());
+        int totalScenes = context.yaml().scenes().size();
+        int totalChapters = context.novelChapterIndexes().size();
+        int coveredChapters = (int) context.novelChapterIndexes().stream()
+                .filter(yamlChapterIndexes::contains)
+                .count();
+        double sceneHealthScore = totalScenes == 0 ? 100 : healthyScenes * 100.0 / totalScenes;
+        double chapterCoverageScore = totalChapters == 0 ? 100 : coveredChapters * 100.0 / totalChapters;
+        double score = sceneHealthScore * 0.7 + chapterCoverageScore * 0.3;
         return new EvaluationCheckResult(
-                metric("structure", "结构完整性", numerator, denominator, "结构问题 %d 个".formatted(issues.size())),
+                metricWithScore("structure", "结构完整性", score, healthyScenes, totalScenes,
+                        "健康场景 %d/%d，章节覆盖 %d/%d，结构问题 %d 个".formatted(
+                                healthyScenes, totalScenes, coveredChapters, totalChapters, issues.size())),
                 issues
         );
     }

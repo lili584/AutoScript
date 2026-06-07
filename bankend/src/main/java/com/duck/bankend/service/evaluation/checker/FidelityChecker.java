@@ -4,9 +4,11 @@ import com.duck.bankend.model.dto.EvaluationIssue;
 import com.duck.bankend.model.evaluation.EvaluationCheckResult;
 import com.duck.bankend.model.evaluation.EvaluationContext;
 import com.duck.bankend.model.evaluation.NovelChapterData;
+import com.duck.bankend.model.evaluation.NovelParagraphData;
 import com.duck.bankend.model.evaluation.YamlBeatData;
 import com.duck.bankend.model.evaluation.YamlCharacterData;
 import com.duck.bankend.model.evaluation.YamlSceneData;
+import com.duck.bankend.model.evaluation.YamlSourceRefData;
 import com.duck.bankend.util.EvaluationTextUtil;
 import com.duck.bankend.util.ScriptCharacterNameNormalizer;
 import org.springframework.stereotype.Component;
@@ -17,7 +19,6 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.function.Function;
 import java.util.stream.Collectors;
 
 @Component
@@ -34,20 +35,21 @@ public class FidelityChecker extends BaseEvaluationChecker {
         int checks = 0;
         for (YamlSceneData scene : context.yaml().scenes()) {
             String chapterText = chapterTextByIndex.getOrDefault(scene.chapterIndex(), context.novel().fullText());
+            String sourceText = sourceText(context, scene, chapterText);
             if (StringUtils.hasText(scene.location())) {
                 checks++;
-                if (!EvaluationTextUtil.containsNormalized(chapterText, scene.location())) {
+                if (!EvaluationTextUtil.containsNormalized(sourceText, scene.location())) {
                     issues.add(issue("Fidelity", "warning", "场景地点原文无依据",
-                            "location 在对应章节原文中没有找到明确依据",
+                            "location 在对应 source_refs 原文段落中没有找到明确依据",
                             scene.id(), scene.chapterIndex(), firstParagraph(scene), lastParagraph(scene),
                             scene.location(), null, "核对地点是否为 AI 概括或幻觉"));
                 }
             }
-            if (StringUtils.hasText(scene.timeOfDay())) {
+            if (StringUtils.hasText(scene.timeOfDay()) && EvaluationTextUtil.normalize(scene.timeOfDay()).length() >= 3) {
                 checks++;
-                if (!EvaluationTextUtil.containsNormalized(chapterText, scene.timeOfDay())) {
+                if (!EvaluationTextUtil.containsNormalized(sourceText, scene.timeOfDay())) {
                     issues.add(issue("Fidelity", "info", "场景时间原文依据较弱",
-                            "time_of_day 在对应章节原文中没有找到直接文本",
+                            "time_of_day 在对应 source_refs 原文段落中没有找到直接文本",
                             scene.id(), scene.chapterIndex(), firstParagraph(scene), lastParagraph(scene),
                             scene.timeOfDay(), null, "如为合理概括可忽略，否则修正时间"));
                 }
@@ -91,6 +93,23 @@ public class FidelityChecker extends BaseEvaluationChecker {
             }
         }
         return names;
+    }
+
+    private String sourceText(EvaluationContext context, YamlSceneData scene, String fallbackChapterText) {
+        if (scene.sourceRefs().isEmpty()) {
+            return fallbackChapterText;
+        }
+        List<String> paragraphs = new ArrayList<>();
+        for (YamlSourceRefData sourceRef : scene.sourceRefs()) {
+            for (NovelParagraphData paragraph : context.novel().paragraphs()) {
+                if (paragraph.chapterIndex() == sourceRef.chapterIndex()
+                        && paragraph.paragraphNumber() >= sourceRef.paragraphStart()
+                        && paragraph.paragraphNumber() <= sourceRef.paragraphEnd()) {
+                    paragraphs.add(paragraph.text());
+                }
+            }
+        }
+        return paragraphs.isEmpty() ? fallbackChapterText : String.join("\n", paragraphs);
     }
 
     private Integer firstParagraph(YamlSceneData scene) {
