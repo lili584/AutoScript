@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import {
+  BarChart3,
   Bot,
   BookOpen,
   ChevronDown,
@@ -16,10 +17,13 @@ import {
   Save,
   Scissors,
   Sparkles,
+  Trophy,
   Trash2,
   Upload,
+  X,
 } from 'lucide-vue-next'
 
+const activeWorkspace = ref('novels')
 const novels = ref([])
 const selectedNovel = ref(null)
 const loading = ref(false)
@@ -38,6 +42,11 @@ const scriptScenes = ref([])
 const yamlPreview = ref('')
 const yamlFileName = ref('')
 const pollingTimer = ref(null)
+const evaluationFileInput = ref(null)
+const evaluationSelectedNovelId = ref('')
+const evaluationFiles = ref([])
+const evaluating = ref(false)
+const showEvaluationRules = ref(false)
 
 const form = reactive({
   title: '',
@@ -52,6 +61,78 @@ const selectedId = computed(() => selectedNovel.value?.id)
 const hasNovels = computed(() => novels.value.length > 0)
 const outlineItems = computed(() => parseMarkdownOutline(contentDraft.value))
 const chunkCount = computed(() => chapters.value.reduce((total, chapter) => total + chapter.chunkCount, 0))
+const evaluationResults = computed(() => evaluationFiles.value.filter((item) => item.status === 'succeeded' && item.report))
+const evaluationSummary = computed(() => {
+  const results = evaluationResults.value
+  if (results.length === 0) {
+    return null
+  }
+
+  const sorted = [...results].sort((left, right) => scoreOf(right.report) - scoreOf(left.report))
+  const total = results.reduce((sum, item) => sum + scoreOf(item.report), 0)
+  return {
+    best: sorted[0],
+    lowest: sorted[sorted.length - 1],
+    average: Math.round((total / results.length) * 10) / 10,
+    passedCount: results.filter((item) => isReportPassed(item.report)).length,
+    totalCount: results.length,
+  }
+})
+const evaluationMetricExtremes = computed(() => {
+  const extremes = {}
+  for (const item of evaluationResults.value) {
+    const metrics = item.report?.scorecard?.metrics || []
+    for (const metric of metrics) {
+      if (!metric?.key) {
+        continue
+      }
+      const score = Number(metric.score || 0)
+      const current = extremes[metric.key] || {
+        highest: score,
+        lowest: score,
+      }
+      current.highest = Math.max(current.highest, score)
+      current.lowest = Math.min(current.lowest, score)
+      extremes[metric.key] = current
+    }
+  }
+  return extremes
+})
+const canEvaluateYaml = computed(() => {
+  return evaluationSelectedNovelId.value && evaluationFiles.value.length > 0 && evaluationFiles.value.length <= 5 && !evaluating.value
+})
+const evaluationRuleItems = [
+  {
+    name: '对白召回率',
+    rule: '检查原文中引号对白是否被 YAML dialogue 覆盖。',
+    implementation: '从小说原文抽取直接对白，与 YAML dialogue 做 Levenshtein 相似度匹配，阈值为 0.75；未匹配的原文对白记为遗漏。',
+  },
+  {
+    name: '对白精确率',
+    rule: '检查 YAML dialogue 是否真实来自原文对白。',
+    implementation: '每条 YAML dialogue 反向匹配原文对白；相似度 >= 0.85 视为可信，0.60-0.85 视为小偏差，低于 0.60 视为疑似编造或叙事误转对白。',
+  },
+  {
+    name: '动作覆盖率',
+    rule: '检查 action/transition beat 是否有有效动作文本。',
+    implementation: '统计 action/transition 中归一化后长度不少于 3 的文本；空动作、无动作场景、全空动作场景会产生 issue。',
+  },
+  {
+    name: '角色一致性',
+    rule: '检查角色是否重复、引用是否能对应顶层 characters。',
+    implementation: '按角色名归一化检测重复人物；检查 scene.characters 和 dialogue.character_id 是否引用了已定义角色。',
+  },
+  {
+    name: '忠实度',
+    rule: '检查地点、时间、对白归属是否有原文依据。',
+    implementation: '优先在 scene.source_refs 对应段落中查找 location/time_of_day；检查 dialogue 角色是否在场景人物中，并识别叙事内容误转对白。',
+  },
+  {
+    name: '结构完整性',
+    rule: '检查 scene 结构是否完整且章节覆盖是否充分。',
+    implementation: '健康场景需要 scene_id 格式正确、beats 数不少于 3、包含 dialogue；最终分数按健康场景占比 70% + 章节覆盖 30% 计算。',
+  },
+]
 
 onMounted(() => {
   loadNovels()
@@ -92,6 +173,23 @@ function validateMarkdownFile(file) {
   return true
 }
 
+function validateYamlFiles(files) {
+  if (files.length === 0) {
+    errorMessage.value = '请选择至少 1 个 YAML 文件'
+    return false
+  }
+  if (files.length > 5) {
+    errorMessage.value = '一次最多测评 5 个 YAML 文件'
+    return false
+  }
+  const invalidFile = files.find((file) => !/\.(ya?ml)$/i.test(file.name))
+  if (invalidFile) {
+    errorMessage.value = `只支持上传 .yaml 或 .yml 文件：${invalidFile.name}`
+    return false
+  }
+  return true
+}
+
 function buildMarkdownFormData(file, extra = {}) {
   const data = new FormData()
   data.append('file', file)
@@ -101,6 +199,63 @@ function buildMarkdownFormData(file, extra = {}) {
     }
   })
   return data
+}
+
+function selectEvaluationFiles(event) {
+  clearMessage()
+  const files = Array.from(event.target.files || [])
+  event.target.value = ''
+  if (!validateYamlFiles(files)) {
+    return
+  }
+  evaluationFiles.value = files.map((file, index) => ({
+    id: `${Date.now()}-${index}`,
+    file,
+    name: file.name,
+    size: file.size,
+    status: 'waiting',
+    report: null,
+    error: '',
+  }))
+}
+
+function clearEvaluationFiles() {
+  evaluationFiles.value = []
+}
+
+async function evaluateYamlFiles() {
+  clearMessage()
+  if (!evaluationSelectedNovelId.value) {
+    errorMessage.value = '请先选择小说'
+    return
+  }
+  if (!validateYamlFiles(evaluationFiles.value.map((item) => item.file))) {
+    return
+  }
+
+  evaluating.value = true
+  try {
+    for (const item of evaluationFiles.value) {
+      item.status = 'running'
+      item.error = ''
+      item.report = null
+      try {
+        const data = new FormData()
+        data.append('file', item.file)
+        item.report = await request(`/api/novels/${evaluationSelectedNovelId.value}/evaluations/yaml`, {
+          method: 'POST',
+          body: data,
+        })
+        item.status = 'succeeded'
+      } catch (error) {
+        item.status = 'failed'
+        item.error = error.message
+      }
+    }
+    successMessage.value = 'YAML 测评完成'
+  } finally {
+    evaluating.value = false
+  }
 }
 
 async function loadNovels() {
@@ -553,6 +708,107 @@ function taskStatusText(status) {
   return statusMap[status] || '未开始'
 }
 
+function evaluationStatusText(status) {
+  const statusMap = {
+    waiting: '等待测评',
+    running: '测评中',
+    succeeded: '已完成',
+    failed: '失败',
+  }
+  return statusMap[status] || '等待测评'
+}
+
+function scoreOf(report) {
+  return Number(report?.overallScore || 0)
+}
+
+function isReportPassed(report) {
+  if (typeof report?.passed === 'boolean') {
+    return report.passed
+  }
+  const metrics = report?.scorecard?.metrics || []
+  return scoreOf(report) >= 80 && metrics.every((metric) => Number(metric.score || 0) >= metricThreshold(metric))
+}
+
+function metricThreshold(metric) {
+  return Number(metric?.threshold ?? 80)
+}
+
+function scoreClass(score) {
+  if (Number(score) >= 85) {
+    return 'score-high'
+  }
+  if (Number(score) >= 70) {
+    return 'score-medium'
+  }
+  return 'score-low'
+}
+
+function overallRankLabel(item) {
+  if (!evaluationSummary.value || evaluationResults.value.length < 2 || !item.report) {
+    return ''
+  }
+  const score = scoreOf(item.report)
+  if (score === scoreOf(evaluationSummary.value.best.report)) {
+    return '最高'
+  }
+  if (score === scoreOf(evaluationSummary.value.lowest.report)) {
+    return '最低'
+  }
+  return ''
+}
+
+function metricRankLabel(metric) {
+  if (evaluationResults.value.length < 2 || !metric?.key) {
+    return ''
+  }
+  const extreme = evaluationMetricExtremes.value[metric.key]
+  if (!extreme || extreme.highest === extreme.lowest) {
+    return ''
+  }
+  const score = Number(metric.score || 0)
+  if (score === extreme.highest) {
+    return '最高'
+  }
+  if (score === extreme.lowest) {
+    return '最低'
+  }
+  return ''
+}
+
+function metricRankClass(metric) {
+  const label = metricRankLabel(metric)
+  return {
+    'metric-best': label === '最高',
+    'metric-worst': label === '最低',
+  }
+}
+
+function topSuggestedIssues(report) {
+  return (report?.issues || [])
+    .filter((issue) => issue?.suggestion)
+    .slice(0, 4)
+}
+
+function issueSeverityText(severity) {
+  const severityMap = {
+    error: '错误',
+    warning: '警告',
+    info: '提示',
+  }
+  return severityMap[severity] || '提示'
+}
+
+function formatFileSize(size) {
+  if (!size) {
+    return '0 KB'
+  }
+  if (size < 1024 * 1024) {
+    return `${Math.ceil(size / 1024)} KB`
+  }
+  return `${(size / 1024 / 1024).toFixed(1)} MB`
+}
+
 function clearMessage() {
   errorMessage.value = ''
   successMessage.value = ''
@@ -609,7 +865,27 @@ function jumpToOutline(item) {
 </script>
 
 <template>
-  <main class="workspace">
+  <div class="app-shell">
+    <nav class="workspace-switcher" aria-label="工作区切换">
+      <button
+        type="button"
+        :class="{ active: activeWorkspace === 'novels' }"
+        @click="activeWorkspace = 'novels'"
+      >
+        <BookOpen :size="18" />
+        小说管理
+      </button>
+      <button
+        type="button"
+        :class="{ active: activeWorkspace === 'evaluation' }"
+        @click="activeWorkspace = 'evaluation'"
+      >
+        <BarChart3 :size="18" />
+        测评对比
+      </button>
+    </nav>
+
+  <main v-if="activeWorkspace === 'novels'" class="workspace">
     <aside class="sidebar">
       <header class="panel-header">
         <div>
@@ -872,4 +1148,175 @@ function jumpToOutline(item) {
       </template>
     </section>
   </main>
+  <main v-else class="evaluation-workspace">
+    <div v-if="errorMessage" class="message error">{{ errorMessage }}</div>
+    <div v-if="successMessage" class="message success">{{ successMessage }}</div>
+
+    <header class="detail-header evaluation-header">
+      <div>
+        <p class="eyebrow">Evaluation</p>
+        <h2>YAML 多文件测评对比</h2>
+        <p>选择一部小说，上传 1-5 份剧本 YAML，横向比较总分和各项指标。</p>
+      </div>
+      <div class="header-actions">
+        <button class="secondary-button compact" type="button" @click="showEvaluationRules = true">
+          <BarChart3 :size="17" />
+          评分规则
+        </button>
+        <button class="icon-button" type="button" title="刷新小说列表" @click="loadNovels">
+          <RefreshCw :size="18" />
+        </button>
+      </div>
+    </header>
+
+    <section class="evaluation-controls">
+      <label>
+        <span>选择小说</span>
+        <select v-model="evaluationSelectedNovelId">
+          <option value="">请选择要测评的小说</option>
+          <option v-for="novel in novels" :key="novel.id" :value="novel.id">
+            {{ novel.title }}
+          </option>
+        </select>
+      </label>
+
+      <div class="upload-box">
+        <input
+          ref="evaluationFileInput"
+          class="file-input"
+          type="file"
+          accept=".yaml,.yml,application/x-yaml,text/yaml"
+          multiple
+          @change="selectEvaluationFiles"
+        />
+        <button class="secondary-button" type="button" :disabled="evaluating" @click="evaluationFileInput?.click()">
+          <Upload :size="18" />
+          选择 YAML
+        </button>
+        <button class="secondary-button" type="button" :disabled="evaluating || evaluationFiles.length === 0" @click="clearEvaluationFiles">
+          <X :size="18" />
+          清空文件
+        </button>
+        <button class="primary-button" type="button" :disabled="!canEvaluateYaml" @click="evaluateYamlFiles">
+          <BarChart3 :size="18" />
+          开始测评
+        </button>
+      </div>
+    </section>
+
+    <section class="evaluation-files">
+      <div class="section-title">
+        <h2><FileText :size="18" /> 待测文件</h2>
+        <span>{{ evaluationFiles.length }}/5</span>
+      </div>
+      <div v-if="evaluationFiles.length === 0" class="outline-empty">选择 1-5 个 YAML 文件开始测评</div>
+      <ul v-else class="evaluation-file-list">
+        <li v-for="item in evaluationFiles" :key="item.id">
+          <div>
+            <strong>{{ item.name }}</strong>
+            <span>{{ formatFileSize(item.size) }}</span>
+          </div>
+          <small :class="`eval-status ${item.status}`">{{ evaluationStatusText(item.status) }}</small>
+        </li>
+      </ul>
+    </section>
+
+    <section v-if="evaluationSummary" class="evaluation-summary">
+      <div class="summary-card">
+        <span>最佳文件</span>
+        <strong>{{ evaluationSummary.best.name }}</strong>
+        <b :class="scoreClass(scoreOf(evaluationSummary.best.report))">{{ scoreOf(evaluationSummary.best.report) }}</b>
+      </div>
+      <div class="summary-card">
+        <span>最低文件</span>
+        <strong>{{ evaluationSummary.lowest.name }}</strong>
+        <b :class="scoreClass(scoreOf(evaluationSummary.lowest.report))">{{ scoreOf(evaluationSummary.lowest.report) }}</b>
+      </div>
+      <div class="summary-card">
+        <span>平均分</span>
+        <strong>{{ evaluationSummary.average }}</strong>
+        <b :class="scoreClass(evaluationSummary.average)">已测 {{ evaluationSummary.totalCount }} 份</b>
+      </div>
+    </section>
+
+    <section class="evaluation-results">
+      <div class="section-title">
+        <h2><Trophy :size="18" /> 测评结果</h2>
+        <span>{{ evaluationResults.length }}</span>
+      </div>
+      <div v-if="evaluationFiles.length === 0" class="outline-empty">暂无测评结果</div>
+      <div v-else class="result-grid">
+        <article v-for="item in evaluationFiles" :key="item.id" class="result-card" :class="{ failed: item.status === 'failed' }">
+          <header>
+            <div>
+              <strong>{{ item.name }}</strong>
+              <span>{{ evaluationStatusText(item.status) }}</span>
+            </div>
+            <b v-if="item.report" class="score-pill" :class="scoreClass(scoreOf(item.report))">
+              {{ scoreOf(item.report) }}
+            </b>
+          </header>
+
+          <p v-if="item.error" class="result-error">{{ item.error }}</p>
+          <template v-else-if="item.report">
+            <div class="result-meta">
+              <span v-if="overallRankLabel(item)" :class="overallRankLabel(item) === '最高' ? 'best' : 'worst'">
+                总分{{ overallRankLabel(item) }}
+              </span>
+              <span>{{ item.report.issues?.length || 0 }} issues</span>
+            </div>
+            <ul class="metric-list">
+              <li
+                v-for="metric in item.report.scorecard?.metrics || []"
+                :key="metric.key"
+                :class="[{ risky: Number(metric.score || 0) < metricThreshold(metric) }, metricRankClass(metric)]"
+              >
+                <span>{{ metric.name }}</span>
+                <strong>
+                  {{ metric.score }}
+                  <em v-if="metricRankLabel(metric)">{{ metricRankLabel(metric) }}</em>
+                </strong>
+                <small>{{ metric.numerator }}/{{ metric.denominator }}</small>
+              </li>
+            </ul>
+            <div v-if="topSuggestedIssues(item.report).length > 0" class="suggestion-panel">
+              <h3>优先修改建议</h3>
+              <ol>
+                <li v-for="issue in topSuggestedIssues(item.report)" :key="`${issue.checker}-${issue.sceneId}-${issue.type}-${issue.paragraphStart}`">
+                  <div>
+                    <span :class="`issue-badge ${issue.severity}`">{{ issueSeverityText(issue.severity) }}</span>
+                    <strong>{{ issue.type }}</strong>
+                    <small v-if="issue.sceneId">{{ issue.sceneId }}</small>
+                  </div>
+                  <p>{{ issue.suggestion }}</p>
+                </li>
+              </ol>
+            </div>
+          </template>
+          <div v-else class="result-empty">{{ item.status === 'running' ? '正在测评...' : '等待开始' }}</div>
+        </article>
+      </div>
+    </section>
+  </main>
+  <div v-if="showEvaluationRules" class="modal-backdrop" @click.self="showEvaluationRules = false">
+    <section class="rules-modal" role="dialog" aria-modal="true" aria-labelledby="rules-title">
+      <header>
+        <div>
+          <p class="eyebrow">Score Rules</p>
+          <h2 id="rules-title">测评分数说明</h2>
+        </div>
+        <button class="icon-button" type="button" title="关闭" @click="showEvaluationRules = false">
+          <X :size="18" />
+        </button>
+      </header>
+      <div class="rules-list">
+        <article v-for="rule in evaluationRuleItems" :key="rule.name" class="rule-item">
+          <h3>{{ rule.name }}</h3>
+          <p>{{ rule.rule }}</p>
+          <small>{{ rule.implementation }}</small>
+        </article>
+      </div>
+    </section>
+  </div>
+  </div>
 </template>

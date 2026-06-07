@@ -8,6 +8,7 @@ import com.duck.bankend.model.dto.ScriptYamlPreview;
 import com.duck.bankend.model.entity.Novel;
 import com.duck.bankend.service.NovelService;
 import com.duck.bankend.service.NovelStructureService;
+import com.duck.bankend.service.ScriptEvaluationService;
 import com.duck.bankend.service.ScriptGenerationService;
 import com.duck.bankend.service.ScriptYamlExportService;
 import lombok.RequiredArgsConstructor;
@@ -35,6 +36,7 @@ public class NovelController {
 
     private final NovelService novelService;
     private final NovelStructureService novelStructureService;
+    private final ScriptEvaluationService scriptEvaluationService;
     private final ScriptGenerationService scriptGenerationService;
     private final ScriptYamlExportService scriptYamlExportService;
 
@@ -133,6 +135,21 @@ public class NovelController {
             return Result.notFound("小说不存在或已删除");
         }
         return Result.searchSuccess(scriptGenerationService.listScenes(id));
+    }
+
+    @PostMapping(value = "/{id}/evaluations/yaml", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public Result evaluateScriptYaml(@PathVariable Long id, @RequestParam("file") MultipartFile file) {
+        try {
+            Object report = scriptEvaluationService.evaluateYaml(id, file);
+            if (report == null) {
+                return Result.notFound("小说不存在或已删除");
+            }
+            return Result.success("测评完成", report);
+        } catch (IllegalArgumentException exception) {
+            return Result.badRequest(exception.getMessage());
+        } catch (IOException exception) {
+            return Result.error("读取 YAML 文件失败");
+        }
     }
 
     @DeleteMapping("/{id}/scripts/scenes")

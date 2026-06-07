@@ -17,3 +17,6 @@ dist-ssr/
 ### Logs ###
 logs/
 *.log
+
+### Local evaluation samples ###
+docs/noval-and-yaml/
