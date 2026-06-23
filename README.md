@@ -1,288 +1,265 @@
 # AutoScript - AI 小说转剧本工具
 
 > 演示视频：https://www.bilibili.com/video/BV1KnEt6MEye/?vd_source=c80ba0f6fecbebaada6d9e607c42e018
-> 
-> 作品方向：AI 小说转剧本工具  
-> 
+> 仓库地址：https://github.com/lili584/AutoScript
 > Schema 文档：[SCRIPT_YAML_SCHEMA.md](SCRIPT_YAML_SCHEMA.md)
 
-AutoScript 是一款面向小说作者的 AI 辅助剧本创作工具。它可以将 3 个章节以上的小说文本自动解析、分块、调用 AI 转换为结构化 scenes，并最终导出可编辑的剧本 YAML 初稿。
+AutoScript 是一款面向小说作者的 AI 辅助剧本创作工具。用户上传 3 个章节以上的 Markdown 小说后，系统会解析章节、拆分 chunk、调用 LLM 抽取结构化剧本场景，并导出可编辑、可追溯、可测评的剧本 YAML 初稿。
 
-## 一句话介绍
+## 项目目标
 
-作者上传 Markdown 小说后，AutoScript 会按章节和段落拆分文本，调用 DeepSeek 生成剧本场景、动作、对白、人物画像和来源追溯信息，并提供 YAML 导出与多版本测评对比。
+小说改编剧本需要拆场景、提对白、整理人物、补动作和校对原文来源。直接让大模型一次性输出完整剧本，容易出现长文本上下文丢失、格式漂移、人物重复、对白编造和来源不可追溯等问题。
 
-## STAR 法介绍项目
+AutoScript 的目标不是生成最终定稿，而是提供一个可继续打磨的结构化初稿：
 
-### Situation 背景
+- 对作者：降低从小说到剧本初稿的整理成本。
+- 对系统：将大模型输出放进可校验、可回溯、可导出的工程链路。
+- 对后续编辑：通过 YAML Schema 和测评报告支持人工二次修改。
 
-很多小说作者希望把自己的作品改编成剧本，但小说和剧本的表达方式不同。小说更偏叙事，剧本更关注场景、人物行动、对白节奏和可拍摄结构。人工改编需要大量拆场景、提对白、整理人物和校对原文来源，门槛较高。
+## 用户流程
 
-### Task 目标
+```text
+新建小说 / 上传 Markdown
+  -> 解析章节和 chunk
+  -> 启动 AI 分析任务
+  -> 查看 scenes 草稿
+  -> 预览并下载 YAML
+  -> 上传 1-5 份 YAML 做测评对比
+```
 
-本项目的目标是在 3 日限时实战内完成一款 AI 辅助剧本创作工具，让作者可以把 3 章以上小说快速转换成结构化 YAML 剧本初稿，并且保留可追溯、可编辑、可测评的结果。
+前端包含两个主要工作区：
 
-### Action 实现
-
-项目按 PR 持续拆分交付，完成了以下核心能力：
-
-- 小说管理：新建、列表、详情、软删除、原文保存。
-- Markdown 导入：支持 `.md` 上传创建、覆盖、追加，也支持文本框追加。
-- 章节解析：按 `#` 和 `##` 识别小说标题与章节标题。
-- chunk 分片：按段落拆分，每块控制在 1500-2000 字，并带上下文。
-- AI 场景抽取：调用 DeepSeek API，把 chunk 转成 scenes JSON。
-- rolling summary：跨 chunk 传递章节状态，改善长场景连续性。
-- 去重与清洗：处理重复 scene、重复 dialogue、空 action、误转对白等问题。
-- 角色画像：scene 生成后再额外汇总人物 aliases、role、description。
-- YAML 导出：汇总 metadata、source、characters、scenes，生成可编辑 YAML。
-- 测评对比：支持上传 1-5 份 YAML，比较 6 个指标和优先修改建议。
-
-### Result 结果
-
-最终效果是：用户可以从小说原文出发，经过“解析章节 → AI 分析 → YAML 导出 → 测评对比”的完整链路，得到结构化剧本初稿，并能根据测评建议继续打磨。
+- 小说管理：小说 CRUD、Markdown 导入、章节解析、AI 分析、YAML 预览与下载。
+- 测评对比：选择小说并上传多份 YAML，横向比较总分、六项指标和修改建议。
 
 ## 核心链路
 
 ```text
 Markdown 小说
   -> 小说管理与原文保存
-  -> 章节解析
-  -> chunk 分片
-  -> DeepSeek scenes 抽取
-  -> 后端清洗 / 去重 / source_refs 修正
+  -> Markdown 章节解析
+  -> 按段落 chunk 分片
+  -> LLM scenes JSON 抽取
+  -> 后端质量校验 / 去重 / 合并 / source_refs 修正
   -> 角色画像生成
   -> YAML 汇总导出
   -> YAML 多版本测评对比
 ```
 
-### 1. Markdown 解析
+### Markdown 解析与 chunk 分片
 
-系统约定：
-
-- `#` 表示小说标题。
-- `##` 表示章节标题。
-- 章节正文按空行拆段落。
-
-如果第一个 `##` 前有正文，会归入“正文前言”。如果全文没有 `##`，后端会提示用户补充章节标题。
-
-### 2. chunk 分片
-
-每章按段落拆成 chunk：
+系统约定 `#` 表示小说标题，`##` 表示章节标题。每章正文按空行拆段落，再按段落组装 chunk：
 
 - chunk 目标长度为 1500-2000 字。
-- 单段超过 2000 字时不强行切断。
-- 后续 chunk 会携带前一 chunk 的上下文。
-- context 使用更稳的混合策略，避免短段落导致上下文不足。
+- 单段超过 2000 字时不强行截断。
+- 后续 chunk 携带前一 chunk 的局部 context。
+- context 使用混合策略，从前一 chunk 末尾向前取段落，满足最小字数或最大段落数后截断。
 
-### 3. AI scenes 抽取
+这套规则优先保证实现稳定和段落可追溯。后续可升级为 AI semantic chunking：先由模型根据段落编号输出语义连续段落组，再由后端校验连续、不重复、不越界。
 
-后端按 chunk 顺序调用 DeepSeek，要求输出 JSON：
+### AI JSON 中间协议
+
+AutoScript 不要求 LLM 直接输出最终 YAML，而是要求先输出 JSON：
 
 ```json
 {
-  "scenes": [],
-  "chapter_state": {}
+  "scenes": [
+    {
+      "scene_id": "chapter-1-chunk-1-scene-1",
+      "title": "咖啡厅偶遇",
+      "location": "咖啡厅",
+      "time_of_day": "白天",
+      "summary": "场景概要",
+      "characters": ["林屿安", "客户"],
+      "beats": [
+        {
+          "type": "action",
+          "text": "林屿安把咖啡杯放回瓷盘。"
+        },
+        {
+          "type": "dialogue",
+          "character_name": "客户",
+          "text": "林总？"
+        }
+      ],
+      "source_refs": [
+        {
+          "chapter_index": 1,
+          "chapter_title": "第一章 重逢",
+          "chunk_index": 1,
+          "paragraph_start": 1,
+          "paragraph_end": 5
+        }
+      ]
+    }
+  ],
+  "chapter_state": {
+    "current_location": "",
+    "active_characters": [],
+    "current_conflict": "",
+    "completed_events": [],
+    "unresolved_questions": [],
+    "open_scene": {
+      "scene_id": "",
+      "title": "",
+      "location": "",
+      "time_of_day": "",
+      "characters": [],
+      "summary": "",
+      "is_resolved": true
+    }
+  }
 }
 ```
 
-`scenes` 保存场景、地点、时间、summary、人物、beats 和 source_refs。  
-`chapter_state` 维护章节级 rolling summary，包括当前地点、人物、冲突、已发生事件和未解决问题。
+这样设计的原因：
 
-### 4. 质量兜底
+- YAML 对缩进和换行敏感，直接让 AI 输出更容易格式损坏。
+- JSON 更适合作为后端校验、清洗、去重和合并的中间结构。
+- 后端可以统一生成稳定的 `scene_id`、`character_id`、`source_refs` 和最终 YAML。
 
-AI 输出后，后端会做确定性清洗：
+### rolling summary 与跨 chunk 合并
 
-- 过滤空 action/transition。
-- 将非直接引号对白降级为 action。
-- scene_id 相同去重。
-- dialogue.character + dialogue.text 去重。
-- dialogue.text 完全相同去重。
-- summary 高相似度合并。
-- source_refs 过宽时按 beats 文本反推段落范围。
-- chunk 输出质量不合格时自动 retry。
+每个 chunk 处理完成后，LLM 会返回 `chapter_state`。下一个 chunk 调用时，后端会把上一 chunk 的 `chapter_state` 和局部 `context` 一起传入模型。
 
-### 5. 异步任务与并发控制
+`chapter_state` 用于保存章节级滚动状态：
 
-AI 分析是长任务，系统使用：
+- 当前地点
+- 活跃人物
+- 当前冲突
+- 已发生关键事件
+- 未解决问题
+- 当前 chunk 结束时可能尚未完结的 `open_scene`
 
-- Java 21 虚拟线程执行后台任务。
-- Redis 保存运行态和进度。
-- Redisson 管理同小说任务锁。
-- 全局 DeepSeek 请求并发控制，避免 API 消耗失控。
+如果长场景被 chunk 截断，下一 chunk 的第一个 scene 可以由 AI 标记：
 
-同一小说同一时间只允许一个 AI 分析任务运行，避免 rolling summary 和 scenes 落库顺序混乱。
-
-### 6. YAML 导出
-
-后端不让 AI 直接输出 YAML，而是采用：
-
-```text
-AI JSON -> 后端校验与汇总 -> YAML
+```json
+{
+  "is_continuation": true,
+  "continuation_of": "chapter-1-chunk-1-scene-3",
+  "continuation_reason": "同一地点、同一人物、同一冲突继续推进"
+}
 ```
 
-这样可以减少 YAML 格式错误，并由后端统一生成稳定的 character_id、scene order、source_refs 和 metadata。
+后端不会直接相信该标记，必须同时满足以下规则才合并：
 
-### 7. 测评对比
+- 上一 chunk 存在未完结 `open_scene`。
+- 当前 scene 是当前 chunk 的第一个 scene。
+- 当前 chunk 与上一 open scene 属于同一章节。
+- chunk 序号相邻。
+- `continuation_of` 指向上一 open scene。
+- 地点和时间不能明显冲突。
+- 人物集合兼容，至少有交集，或其中一侧为空。
 
-测评模块不调用 AI，使用确定性规则评估 YAML：
+校验通过后，后端合并 beats、characters、source_refs 和 summary；否则忽略 continuation 标记，将当前 scene 作为新场景保存。
 
-- 对白召回率
-- 对白精确率
-- 动作覆盖率
-- 角色一致性
-- 忠实度
-- 结构完整性
+### source_refs 修正
 
-前端支持上传 1-5 份 YAML 做横向比较，标记总分和小指标的最高/最低，并展示优先修改建议。
+LLM 会为每个 scene 标记段落来源，但模型常出现退化范围，例如多个 scene 都指向同一个完整 chunk。后端会对 `source_refs` 做二次处理：
 
-## 项目亮点
+1. 如果 AI 返回的段落范围是 chunk 子范围且不异常，直接保留。
+2. 如果范围覆盖整个 chunk、覆盖 80% 以上，或接近整个 chunk，判定为退化。
+3. 退化时，后端使用 beat 文本回当前 chunk 原文段落反查。
+4. 优先匹配 dialogue 文本，action/transition 作为辅助。
+5. 文本匹配不到时，按 scene 在 chunk 内的顺序做连续段落兜底切分。
+6. 最后对同一 chunk 内多个 scene 的范围做顺序平滑，避免范围倒序或全部指向整块。
 
-### AI 方向亮点
+最终 YAML 中的 `source_refs` 来自 `AI 标记 + 后端反推 + 顺序兜底 + 平滑`，用于帮助作者回到原文校对。
 
-1. **两阶段生成**
+### 质量校验与 retry
 
-   AI 先输出 JSON，后端再汇总成 YAML，降低格式漂移风险。
+LLM 响应会经过两层校验：
 
-2. **rolling summary**
+- JSON 解析校验：响应必须能解析为 JSON，且顶层包含 `scenes` 数组。
+- 质量校验：过滤空 action/transition、空 dialogue、无有效 beat 的 scene，并检测空 action 比例、空 scenes、只有对白无动作等问题。
 
-   每个 chunk 处理后保存章节状态，下一个 chunk 可以看到前文的地点、人物、冲突和未解决问题。
+如果 JSON 可解析但质量不合格，后端会把失败原因写入 retry prompt，针对同一个 chunk 重新生成一次。重试仍不合格时，任务失败并返回具体章节和 chunk 位置。
 
-3. **跨 chunk continuation 合并**
+### 角色画像
 
-   如果长场景被 chunk 截断，AI 可标记 continuation，后端再校验是否合并到上一场景。
+角色是否存在由 scenes 决定，不由角色画像模型决定。后端从 `scene.characters` 和 `dialogue.character_name` 汇总基础人物表，并生成稳定 `character_id` 和首次出场 scene。
 
-4. **质量校验与 retry**
+所有 scenes 生成完成后，系统再构造精简 scenes 摘要数组，额外调用一次 LLM 生成角色画像：
 
-   后端发现空 action、空 scenes、source_refs 退化等问题时，会要求 AI 重试一次。
+```json
+[
+  {
+    "scene_id": "chapter-1-chunk-1-scene-1",
+    "title": "咖啡厅偶遇",
+    "location": "咖啡厅",
+    "time_of_day": "白天",
+    "summary": "场景概要",
+    "characters": ["林屿安", "客户"],
+    "dialogue_speakers": ["客户", "林屿安"]
+  }
+]
+```
 
-5. **source_refs 精细化**
+模型只补充 `aliases`、`role`、`description`。后端保存前会用已知角色集合过滤，避免 AI 新增幽灵角色。角色画像失败不会阻塞主生成流程，YAML 会回退为空画像字段或保留上一次成功结果。
 
-   后端不完全相信 AI 的段落范围，会根据 dialogue/action 文本反推实际段落，避免多个 scene 全部指向同一个 chunk 范围。
+## YAML 导出
 
-6. **角色画像后处理**
+后端采用确定性导出流程：
 
-   scenes 生成完成后，再从全局 scene 摘要生成人物画像，不影响 scene 抽取主链路。
+```text
+script_scenes / script_dialogues / script_character_profiles
+  -> 汇总 characters
+  -> 映射 character_id
+  -> 排序 scenes
+  -> 写入 metadata / source / characters / scenes
+  -> 生成 .yaml
+```
 
-### 工程方向亮点
+YAML Schema 详见 [SCRIPT_YAML_SCHEMA.md](SCRIPT_YAML_SCHEMA.md)。该 Schema 以 `scenes` 为核心，使用 `beats` 保留 action、dialogue、transition 的顺序，并通过 `source_refs` 支持原文追溯。
 
-1. **PR 持续交付**
+## 测评系统
 
-   功能按 PR 拆分：小说管理、上传追加、章节分块、AI 抽取、YAML 导出、Redis 任务运行时、测评模块、角色画像等，避免最后一次性导入。
+测评模块不调用 AI，定位为 deterministic quality gate，用于筛查 AI 输出中高频、可规则化识别的问题。它不是文学质量评分，也不判断剧情是否精彩。
 
-2. **长任务运行态设计**
+六项指标如下：
 
-   PostgreSQL 保存最终数据，Redis 保存高频变化的任务运行态和锁。
+| 指标 | 目的 |
+| --- | --- |
+| 对白召回率 | 检查原文直接对白是否被 YAML dialogue 保留。 |
+| 对白精确率 | 检查 YAML dialogue 是否疑似编造，或是否把叙事误转为对白。 |
+| 动作覆盖率 | 检查 action/transition beat 是否存在且有有效文本。 |
+| 角色一致性 | 检查重复角色、未定义角色引用和对白角色引用问题。 |
+| 忠实度 | 检查地点、时间、对白角色和叙事转对白是否有原文依据。 |
+| 结构完整性 | 检查 scene_id、beat 数量、dialogue 存在性和章节覆盖。 |
 
-3. **并发控制**
+测评结果包含：
 
-   通过 Redisson 锁限制同小说任务，通过全局并发限制控制 DeepSeek 请求数量。
+- `overallScore`
+- 六项 `scorecard.metrics`
+- 结构化 `issues`
+- 可展示的 `issuesMarkdown`
 
-4. **测评系统**
+硬规则可能误判纯动作场景、合理概括和文学化改写。后续可引入 embedding 相似度、LLM-as-judge 或 RAGAS-like reference-based evaluation，提升对语义等价和合理改写的判断能力。
 
-   不只生成 YAML，还提供质量评估和修改建议，方便作者比较不同版本。
+## 技术架构
 
-## 演示视频建议流程
+```text
+frontend/
+  Vue 3 + Vite
 
-录屏时建议按下面顺序讲解，覆盖评审关注的功能完整度、技术链路和演示效果。
-
-### 0. 开场介绍
-
-建议讲：
-
-> 大家好，这是 AutoScript，一个 AI 小说转剧本工具。它面向小说作者，目标是把 3 章以上的小说文本自动转换成结构化 YAML 剧本初稿，并保留人物、场景、对白、动作和来源追溯信息。
-
-### 1. 展示项目结构
-
-打开仓库根目录，展示：
-
-- `bankend/`：Spring Boot 后端。
-- `frontend/`：Vue 前端。
-- `SCRIPT_YAML_SCHEMA.md`：剧本 YAML Schema 文档。
-- `.github/pull_request_template.md`：PR 模板。
-
-建议讲：
-
-> 项目采用前后端分离，后端负责小说解析、AI 调用、任务调度、YAML 导出和测评；前端负责小说管理、AI 进度展示、YAML 下载和多文件测评。
-
-### 2. 展示小说管理和 Markdown 上传
-
-操作：
-
-1. 打开前端页面。
-2. 上传或选择一篇 3 章以上小说。
-3. 展示原始 Markdown 文本和右侧大纲。
-
-建议讲：
-
-> Markdown 中 `#` 是小说标题，`##` 是章节标题。系统会按章节和段落进行解析。
-
-### 3. 展示章节解析与 chunk
-
-操作：
-
-1. 点击“解析章节”。
-2. 展示章节数量和 chunk 数量。
-3. 展开章节查看 chunk 字数、段落范围和 context。
-
-建议讲：
-
-> 每章会按段落拆 chunk，每块控制在 1500 到 2000 字左右。后续 chunk 会带上前文 context，避免 AI 缺上下文。
-
-### 4. 展示 AI 分析
-
-操作：
-
-1. 点击“开始 AI 分析”。
-2. 展示任务状态和进度条。
-3. 展示生成后的 scene 列表。
-
-建议讲：
-
-> AI 分析是异步任务。后端使用 Redis 保存运行态，Redisson 做同小说任务锁，并通过并发控制限制 DeepSeek 请求数量。
-
-### 5. 展示 YAML 导出
-
-操作：
-
-1. 点击“预览 YAML”。
-2. 展示 `metadata`、`characters`、`scenes`。
-3. 点击“下载 YAML”。
-
-建议讲：
-
-> AI 不直接输出最终 YAML，而是先输出 JSON，后端做清洗、去重、角色汇总和来源追溯，再生成 YAML。
-
-### 6. 展示 YAML Schema 文档
-
-操作：
-
-1. 打开 `SCRIPT_YAML_SCHEMA.md`。
-2. 讲解顶层结构和设计原因。
-
-建议讲：
-
-> Schema 以 scenes 为主结构，因为剧本的基本单位是场景；characters 独立放置，避免人物信息重复；beats 混合 action/dialogue/transition，保留剧本节奏；source_refs 用于回溯小说原文。
-
-### 7. 展示测评对比
-
-操作：
-
-1. 切换到“测评对比”。
-2. 选择小说。
-3. 上传 1-5 份 YAML。
-4. 点击测评。
-5. 展示总分、小指标、最高/最低标记和优先修改建议。
-6. 点击“评分规则”弹窗。
-
-建议讲：
-
-> 测评模块不调用 AI，而是使用确定性规则检查对白召回、对白精确率、动作覆盖、角色一致性、忠实度和结构完整性。
-
-### 8. 收尾
-
-建议讲：
-
-> 这个工具目前已经完成从小说输入到 YAML 剧本导出，再到质量测评的完整闭环。后续可以继续增加 scene 在线编辑、角色画像编辑、分章节重跑和导出历史管理。
+bankend/
+  Spring Boot 4 + Java 21
+  MyBatis Plus
+  PostgreSQL
+  Redis / Redisson
+  RestClient 调用 LLM OpenAI-compatible API
+  SnakeYAML / Jackson
+```
+
+AI 分析是长任务：
+
+- Java 21 virtual thread per task executor 执行后台任务。
+- Java Semaphore 控制同一 JVM 内运行任务数和 LLM 请求并发数。
+- Redis 保存任务运行态、最新任务索引和同小说任务锁。
+- PostgreSQL 保存任务历史、chapters、chunks、scenes、dialogues、chapter_state 和角色画像。
+- 服务重启时将遗留的 pending/running 任务标记为 failed，避免前端一直显示运行中。
+
+当前版本使用 Redisson `RLock` 做单 Redis 同小说互斥。由于任务启动线程和后台执行线程不同，释放时使用 `forceUnlock`。后续更严谨的长任务锁可改为基于 taskId token 的 Redis `SET NX EX` 锁，避免锁 ownership 绑定线程。
 
 ## 启动方式
 
@@ -292,27 +269,36 @@ AI JSON -> 后端校验与汇总 -> YAML
 - Node.js
 - PostgreSQL
 - Redis
-- DeepSeek API Key
+- LLM API Key
 
-### 启动 Redis
+### 后端
 
-```powershell
-docker compose -f docker-compose.redis.yml up -d
-```
-
-### 启动后端
+Windows:
 
 ```powershell
 cd bankend
 .\mvnw.cmd spring-boot:run
 ```
 
-### 启动前端
+Linux/macOS:
+
+```bash
+cd bankend
+./mvnw.sh spring-boot:run
+```
+
+### 前端
 
 ```powershell
 cd frontend
 npm install
 npm run dev
+```
+
+### Redis
+
+```powershell
+docker compose -f docker-compose.redis.yml up -d
 ```
 
 ## 配置说明
@@ -330,7 +316,7 @@ REDIS_USERNAME=autoscript
 REDIS_PASSWORD=你的 Redis 密码
 
 DEEPSEEK_BASE_URL=https://api.deepseek.com
-DEEPSEEK_API_KEY=你的 DeepSeek API Key
+DEEPSEEK_API_KEY=你的 LLM API Key
 DEEPSEEK_MODEL=deepseek-v4-flash
 DEEPSEEK_MAX_TOKENS=8000
 
@@ -348,6 +334,13 @@ cd bankend
 .\mvnw.cmd test
 ```
 
+Linux/macOS:
+
+```bash
+cd bankend
+./mvnw.sh test
+```
+
 前端：
 
 ```powershell
@@ -356,8 +349,6 @@ npm run build
 ```
 
 ## 第三方依赖
-
-主要依赖：
 
 - Spring Boot 4
 - MyBatis Plus
@@ -370,23 +361,12 @@ npm run build
 - Vue 3
 - Vite
 - lucide-vue-next
-- DeepSeek API
-
-原创实现部分：
-
-- Markdown 章节解析和 chunk 分片。
-- AI scenes JSON 协议。
-- rolling summary 和 continuation 合并。
-- AI 输出清洗、去重和 source_refs 反推。
-- YAML 汇总导出。
-- YAML Schema 设计。
-- YAML 测评 checker。
-- 前端多文件测评对比。
+- LLM OpenAI-compatible API
 
 ## 后续优化方向
 
-- 支持 scene 在线编辑。
-- 支持角色画像手动编辑。
-- 支持只重跑某一章或某个 chunk。
-- 支持 YAML 导出历史。
-- 支持更多模型提供方。
+- AI semantic chunking：由模型先输出语义连续段落组，再进行 scenes 抽取。
+- Character Memory：将角色画像升级为带 source_refs 的人物事实库。
+- LLM-as-judge 测评：引入语义等价判断，减少硬规则误判。
+- scene 在线编辑：支持作者在导出前调整场景、对白和动作。
+- 分章节重跑：只重跑某一章或某个 chunk，降低生成成本。

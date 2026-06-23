@@ -38,4 +38,5 @@
 
 - 后端改动至少运行：`.\mvnw.cmd test`。
 - 移动类或改包名后，如遇旧 class 扫描冲突，运行：`.\mvnw.cmd clean test`。
+- Linux/macOS 环境使用 `./mvnw.sh test`；Windows 环境使用 `.\mvnw.cmd test`。
 - 涉及 AI 调用时，如无真实 API Key，可验证任务创建前置条件和编译测试；有 Key 时再做抽样实调。
