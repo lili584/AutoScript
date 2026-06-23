@@ -19,6 +19,7 @@
 
 - 后端测试：`cd bankend && .\mvnw.cmd test`
 - 后端启动：`cd bankend && .\mvnw.cmd spring-boot:run`
+- 后端 Linux/macOS 测试：`cd bankend && ./mvnw.sh test`
 - Redis 启动：`docker compose -f docker-compose.redis.yml up -d`
 - 前端安装：`cd frontend && npm install`
 - 前端启动：`cd frontend && npm run dev`
